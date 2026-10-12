@@ -1,0 +1,93 @@
+:root {
+  font-family: system-ui, sans-serif;
+  color: #17202a;
+  background: #f5f7fa;
+}
+
+body {
+  margin: 0;
+}
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+button {
+  padding: 0.5rem 0.8rem;
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
+.page {
+  max-width: 1000px;
+  margin: 0 auto;
+  padding: 1.5rem;
+}
+
+section {
+  margin: 1.5rem 0;
+  padding: 1rem;
+  background: white;
+  border: 1px solid #dce2e8;
+  border-radius: 8px;
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 1rem;
+  align-items: end;
+}
+
+label {
+  display: grid;
+  gap: 0.35rem;
+}
+
+input,
+select {
+  box-sizing: border-box;
+  min-height: 2.4rem;
+  padding: 0.4rem;
+}
+
+.room-list {
+  padding: 0;
+  list-style: none;
+}
+
+.room-list li {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.75rem 0;
+  border-bottom: 1px solid #e5e9ed;
+}
+
+.error {
+  padding: 0.75rem;
+  color: #842029;
+  background: #f8d7da;
+}
+
+.table-wrap {
+  overflow-x: auto;
+}
+
+table {
+  width: 100%;
+  margin-top: 1rem;
+  border-collapse: collapse;
+}
+
+th,
+td {
+  padding: 0.6rem;
+  border-bottom: 1px solid #e5e9ed;
+  text-align: left;
+}
