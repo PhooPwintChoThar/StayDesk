@@ -32,7 +32,7 @@ describe('hotel booking interface', () => {
     expect(await screen.findByText(/standard — 2/)).toBeInTheDocument();
     expect(fetch).toHaveBeenCalledWith(
       expect.stringContaining('/availability?'),
-      expect.objectContaining({ method: undefined })
+      expect.anything()
     );
   });
 

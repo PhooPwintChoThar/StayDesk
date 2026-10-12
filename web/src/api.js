@@ -1,13 +1,33 @@
-const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:3000')
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:3010')
   .replace(/\/$/, '');
 
+let tokenPromise;
+
+function getToken() {
+  tokenPromise ??= fetch(`${API_BASE_URL}/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ role: 'agent' })
+  })
+    .then(async (res) => {
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'Login failed');
+      return data.token;
+    })
+    .catch((err) => {
+      tokenPromise = undefined;
+      throw err;
+    });
+  return tokenPromise;
+}
+
 export async function apiRequest(path, options = {}) {
-  const token = import.meta.env.VITE_API_TOKEN;
+  const token = import.meta.env.VITE_API_TOKEN || await getToken();
   const response = await fetch(`${API_BASE_URL}${path}`, {
     ...options,
     headers: {
       ...(options.body ? { 'Content-Type': 'application/json' } : {}),
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      Authorization: `Bearer ${token}`,
       ...options.headers
     }
   });

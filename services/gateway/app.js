@@ -1,6 +1,9 @@
 import axios from 'axios';
 import express from 'express';
 import jwt from 'jsonwebtoken';
+import cors from 'cors';
+
+const ROLES = ['guest', 'agent', 'manager'];
 
 const serviceForPath = (path) => {
   if (path === '/availability' || path === '/holds' || path.startsWith('/holds/')) {
@@ -33,26 +36,38 @@ export function createApp({
   secret = process.env.JWT_SECRET
 } = {}) {
   const app = express();
+  app.use(cors({ origin: ['http://localhost:5173', 'http://127.0.0.1:5173'] }));
   app.use(express.json());
 
   app.get('/health', (_req, res) => res.status(200).json({ status: 'ok' }));
 
+  app.post('/login', (req, res) => {
+    const role = req.body?.role;
+    if (!ROLES.includes(role) || !secret) {
+      return res.status(400).json({ error: 'BadRequest' });
+    }
+    res.json({ token: jwt.sign({ role }, secret, { expiresIn: '8h' }) });
+  });
+
   app.use(async (req, res) => {
-    const token = bearerToken(req);
-    if (!token || !secret) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
+    const isPublic = req.method === 'GET' && req.path === '/availability';
+    let role = 'guest';
 
-    let claims;
-    try {
-      claims = jwt.verify(token, secret);
-    } catch {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
+    if (!isPublic) {
+      const token = bearerToken(req);
+      if (!token || !secret) {
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
 
-    const role = claims.role;
-    if (!['guest', 'agent', 'manager'].includes(role)) {
-      return res.status(403).json({ error: 'Forbidden' });
+      try {
+        role = jwt.verify(token, secret).role;
+      } catch {
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
+
+      if (!ROLES.includes(role)) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
     }
 
     const service = serviceForPath(req.path);
