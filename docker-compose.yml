@@ -1,0 +1,118 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    ports:
+      - "55432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  gateway:
+    build: ./services/gateway
+    ports:
+      - "3010:3010"
+    environment:
+      PORT: 3000
+      GUEST_SERVICE_URL: http://guest:3000
+      RESERVATION_SERVICE_URL: http://reservation:3000
+      ROOM_RATE_SERVICE_URL: http://room-rate:3000
+      BILLING_SERVICE_URL: http://billing:3000
+      NOTIFICATION_SERVICE_URL: http://notification:3000
+    depends_on:
+      - guest
+      - reservation
+      - room-rate
+      - billing
+      - notification
+
+  guest:
+    build: ./services/guest
+    ports:
+      - "3001:3000"
+    environment:
+      PORT: 3000
+      DATABASE_URL: "postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/guest_db"
+      RABBITMQ_URL: amqp://rabbitmq:5672
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  reservation:
+    build: ./services/reservation
+    ports:
+      - "3002:3000"
+    environment:
+      PORT: 3000
+      DATABASE_URL: "postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/reservation_db"
+      RABBITMQ_URL: amqp://rabbitmq:5672
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  room-rate:
+    build: ./services/room-rate
+    ports:
+      - "3003:3000"
+    environment:
+      PORT: 3000
+      DATABASE_URL: "postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/room_rate_db"
+      RABBITMQ_URL: amqp://rabbitmq:5672
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  billing:
+    build: ./services/billing
+    ports:
+      - "3004:3000"
+    environment:
+      PORT: 3000
+      DATABASE_URL: "postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/payment_db"
+      RABBITMQ_URL: amqp://rabbitmq:5672
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  notification:
+    build: ./services/notification
+    ports:
+      - "3005:3000"
+    environment:
+      PORT: 3000
+      DATABASE_URL: "postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/notification_db"
+      RABBITMQ_URL: amqp://rabbitmq:5672
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+volumes:
+  postgres_data:

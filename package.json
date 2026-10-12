@@ -1,0 +1,8 @@
+{
+  "name": "hotel-guest-reservation",
+  "private": true,
+  "workspaces": ["services/*", "web"],
+  "scripts": {
+    "test": "npm test --workspaces --if-present"
+  }
+}

@@ -1,0 +1,515 @@
+openapi: 3.1.0
+info:
+  title: Hotel Guest and Reservation Service APIs
+  version: 1.0.0
+  description: |
+    Service endpoints for room-rate, guest, billing, and reservation.
+    Each service uses its own base URL.
+
+paths:
+  /availability:
+    get:
+      operationId: getAvailability
+      tags: [room-rate]
+      parameters:
+        - name: checkIn
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+        - name: checkOut
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+        - name: roomTypeId
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Available room types and rates
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [availability]
+                properties:
+                  availability:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Availability"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /holds:
+    post:
+      operationId: createRoomHold
+      tags: [room-rate]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [roomTypeId, checkIn, checkOut]
+              properties:
+                roomTypeId:
+                  type: string
+                checkIn:
+                  type: string
+                  format: date
+                checkOut:
+                  type: string
+                  format: date
+      responses:
+        "201":
+          description: Room hold created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RoomHold"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /holds/{id}/confirm:
+    post:
+      operationId: confirmRoomHold
+      tags: [room-rate]
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      responses:
+        "200":
+          description: Room hold confirmed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RoomHold"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /holds/{id}:
+    delete:
+      operationId: releaseRoomHold
+      tags: [room-rate]
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      responses:
+        "204":
+          description: Room hold released
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /guests/get-or-create:
+    post:
+      operationId: getOrCreateGuest
+      tags: [guest]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GuestInput"
+      responses:
+        "200":
+          description: Existing guest returned
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Guest"
+        "201":
+          description: Guest created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Guest"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /guests/search:
+    get:
+      operationId: searchGuests
+      tags: [guest]
+      parameters:
+        - name: q
+          in: query
+          required: true
+          description: Search by guest name or email
+          schema:
+            type: string
+            minLength: 1
+      responses:
+        "200":
+          description: Matching guests
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [guests]
+                properties:
+                  guests:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Guest"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /guests/{id}:
+    put:
+      operationId: updateGuest
+      tags: [guest]
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GuestInput"
+      responses:
+        "200":
+          description: Guest updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Guest"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /deposits:
+    post:
+      operationId: authorizeDeposit
+      tags: [billing]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reservationNo, guestId, amount, currency]
+              properties:
+                reservationNo:
+                  type: string
+                guestId:
+                  type: string
+                amount:
+                  type: number
+                  exclusiveMinimum: 0
+                currency:
+                  type: string
+                  pattern: "^[A-Z]{3}$"
+                idempotencyKey:
+                  type: string
+      responses:
+        "201":
+          description: Deposit authorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DepositResult"
+        "402":
+          description: Deposit declined
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /refunds:
+    post:
+      operationId: refundDeposit
+      tags: [billing]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [depositId, amount, currency]
+              properties:
+                depositId:
+                  type: string
+                amount:
+                  type: number
+                  exclusiveMinimum: 0
+                currency:
+                  type: string
+                  pattern: "^[A-Z]{3}$"
+                idempotencyKey:
+                  type: string
+      responses:
+        "201":
+          description: Refund processed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RefundResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /reservations:
+    post:
+      operationId: createReservation
+      tags: [reservation]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [guest, roomTypeId, checkIn, checkOut, depositAmount, currency]
+              properties:
+                guest:
+                  $ref: "#/components/schemas/GuestInput"
+                roomTypeId:
+                  type: string
+                checkIn:
+                  type: string
+                  format: date
+                checkOut:
+                  type: string
+                  format: date
+                depositAmount:
+                  type: number
+                  exclusiveMinimum: 0
+                currency:
+                  type: string
+                  pattern: "^[A-Z]{3}$"
+      responses:
+        "201":
+          description: Reservation created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Reservation"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "402":
+          description: Deposit declined
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /reservations/{no}:
+    parameters:
+      - name: no
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: getReservation
+      tags: [reservation]
+      responses:
+        "200":
+          description: Reservation details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Reservation"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    put:
+      operationId: updateReservation
+      tags: [reservation]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [roomTypeId, checkIn, checkOut]
+              properties:
+                roomTypeId:
+                  type: string
+                checkIn:
+                  type: string
+                  format: date
+                checkOut:
+                  type: string
+                  format: date
+      responses:
+        "200":
+          description: Reservation updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Reservation"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+    delete:
+      operationId: cancelReservation
+      tags: [reservation]
+      responses:
+        "204":
+          description: Reservation cancelled
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+components:
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+
+  schemas:
+    Availability:
+      type: object
+      required: [roomTypeId, available, nightlyRate, currency]
+      properties:
+        roomTypeId:
+          type: string
+        available:
+          type: boolean
+        nightlyRate:
+          type: number
+          minimum: 0
+        currency:
+          type: string
+          pattern: "^[A-Z]{3}$"
+
+    RoomHold:
+      type: object
+      required: [id, roomTypeId, checkIn, checkOut, status, expiresAt]
+      properties:
+        id:
+          type: string
+        roomTypeId:
+          type: string
+        checkIn:
+          type: string
+          format: date
+        checkOut:
+          type: string
+          format: date
+        status:
+          type: string
+          enum: [held, confirmed, released, expired]
+        expiresAt:
+          type: string
+          format: date-time
+
+    GuestInput:
+      type: object
+      required: [email, firstName, lastName]
+      properties:
+        email:
+          type: string
+          format: email
+        firstName:
+          type: string
+        lastName:
+          type: string
+        phone:
+          type: string
+
+    Guest:
+      allOf:
+        - $ref: "#/components/schemas/GuestInput"
+        - type: object
+          required: [id]
+          properties:
+            id:
+              type: string
+
+    DepositResult:
+      type: object
+      required: [depositId, status, amount, currency]
+      properties:
+        depositId:
+          type: string
+        status:
+          type: string
+          enum: [authorized]
+        amount:
+          type: number
+        currency:
+          type: string
+
+    RefundResult:
+      type: object
+      required: [refundId, depositId, status, amount, currency]
+      properties:
+        refundId:
+          type: string
+        depositId:
+          type: string
+        status:
+          type: string
+          enum: [refunded]
+        amount:
+          type: number
+        currency:
+          type: string
+
+    Reservation:
+      type: object
+      required: [reservationNo, guestId, roomTypeId, checkIn, checkOut, status]
+      properties:
+        reservationNo:
+          type: string
+        guestId:
+          type: string
+        roomTypeId:
+          type: string
+        checkIn:
+          type: string
+          format: date
+        checkOut:
+          type: string
+          format: date
+        status:
+          type: string
+          enum: [confirmed, cancelled]
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+        message:
+          type: string
+
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Conflict:
+      description: Request conflicts with the current resource state
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
