@@ -70,7 +70,13 @@ export function createApp({ db = pool, http = axios, publishEvent = publishConfi
   app.use(express.json());
 
   const release = async (id) => {
-    if (id) await http.delete(`${roomRateUrl()}/holds/${id}`);
+    if (!id) return;
+    try {
+      await http.delete(`${roomRateUrl()}/holds/${id}`);
+    } catch (err) {
+      const status = err.response?.status;
+      if (status !== 404 && status !== 409) throw err;
+    }
   };
 
   app.get('/health', (_req, res) => res.status(200).json({ status: 'ok' }));
@@ -116,15 +122,16 @@ export function createApp({ db = pool, http = axios, publishEvent = publishConfi
         depositResult = await http.post(`${billingUrl()}/deposits`, {
           reservationNo, guestId, amount: depositAmount, currency
         });
-      } catch (error) {
-        if (error.response?.status === 402) {
+      } catch (err) {
+        console.error(err);
+        if (err.response?.status === 402) {
           await release(holdId);
           holdId = undefined;
           return fail(res, 402, 'PaymentDeclined', 'The deposit was declined.');
         }
-        throw error;
+        throw err;
       }
-      depositId = depositResult.data.depositId;
+      depositId = depositResult.data.id ?? depositResult.data.depositId;
 
       await db.query(
         `INSERT INTO reservations
@@ -156,14 +163,15 @@ export function createApp({ db = pool, http = axios, publishEvent = publishConfi
     } catch (error) {
       if (saved) {
         await db.query('DELETE FROM reservations WHERE reservation_no = $1', [reservationNo])
-          .catch(() => {});
+          .catch((err) => console.error(err));
       }
-      if (holdId) await release(holdId).catch(() => {});
+      if (holdId) await release(holdId).catch((err) => console.error(err));
       if (depositId) {
         await http.post(`${billingUrl()}/refunds`, {
           depositId, amount: depositAmount, currency
-        }).catch(() => {});
+        }).catch((err) => console.error(err));
       }
+      console.error(error);
       return next(error);
     }
   });
@@ -241,7 +249,8 @@ export function createApp({ db = pool, http = axios, publishEvent = publishConfi
       await release(current.hold_id);
       return res.status(200).json(updated.rows[0]);
     } catch (error) {
-      if (newHoldId) await release(newHoldId).catch(() => {});
+      if (newHoldId) await release(newHoldId).catch((err) => console.error(err));
+      console.error(error);
       return next(error);
     }
   });
@@ -266,16 +275,22 @@ export function createApp({ db = pool, http = axios, publishEvent = publishConfi
 
       await release(reservation.hold_id);
 
-      const refundAmount = Math.round(
-        Number(reservation.deposit_amount) * percent
-      ) / 100;
+      const refundAmount = Math.round(Number(reservation.deposit_amount) * percent) / 100;
 
       if (refundAmount > 0 && reservation.deposit_id) {
-        await http.post(`${billingUrl()}/refunds`, {
-          depositId: reservation.deposit_id,
-          amount: refundAmount,
-          currency: reservation.currency.trim()
-        });
+        try {
+          await http.post(`${billingUrl()}/refunds`, {
+            depositId: reservation.deposit_id,
+            amount: refundAmount,
+            currency: reservation.currency.trim()
+          });
+        } catch (err) {
+          console.error(err);
+          const message = err.response?.data?.message
+            || err.response?.data?.error
+            || err.message;
+          return fail(res, 502, 'BillingError', message);
+        }
       }
 
       await db.query(
@@ -284,6 +299,7 @@ export function createApp({ db = pool, http = axios, publishEvent = publishConfi
       );
       return res.status(204).end();
     } catch (error) {
+      console.error(error);
       return next(error);
     }
   });

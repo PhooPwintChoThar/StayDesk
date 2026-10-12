@@ -49,7 +49,7 @@ describe('reservation endpoints', () => {
     nock(guestService).post('/guests/get-or-create').reply(201, { id: 'guest-1' });
     nock(billing).post('/deposits', (body) =>
       body.reservationNo && body.guestId === 'guest-1'
-    ).reply(201, { depositId: 'deposit-1', status: 'authorized' });
+    ).reply(201, { id: 'deposit-1', status: 'authorized' });
     nock(roomRate).post('/holds/hold-1/confirm').reply(200, { status: 'confirmed' });
 
     const response = await request(app).post('/reservations').send(reservationPayload);
@@ -99,8 +99,10 @@ describe('reservation endpoints', () => {
 
     const release = nock(roomRate).delete('/holds/hold-cancel').reply(204);
     const refund = nock(billing).post('/refunds', {
-      depositId: 'deposit-cancel', amount: 50, currency: 'USD'
-    }).reply(201, { status: 'refunded' });
+      depositId: 'deposit-cancel',
+      amount: 50,
+      currency: 'USD'
+    }).reply(201, { id: 'refund-1', status: 'refunded' });
 
     const response = await request(createApp({ db: pool, publishEvent: jest.fn() }))
       .delete('/reservations/R-CANCEL');
@@ -112,6 +114,38 @@ describe('reservation endpoints', () => {
     const row = await pool.query(
       'SELECT status FROM reservations WHERE reservation_no = $1',
       ['R-CANCEL']
+    );
+    expect(row.rows[0].status).toBe('cancelled');
+  });
+
+  it('continues cancellation and refunds when the hold is not found', async () => {
+    await pool.query(
+      `INSERT INTO reservations
+        (reservation_no, guest_id, room_type_id, hold_id, check_in, check_out,
+         total_amount, deposit_id, deposit_amount, currency, status)
+       VALUES ('R-MISSING-HOLD', 'guest-1', 'standard', 'missing-hold', $1, $2,
+               200, 'deposit-missing-hold', 50, 'USD', 'confirmed')`,
+      [dates.checkIn, dates.checkOut]
+    );
+
+    const release = nock(roomRate).delete('/holds/missing-hold')
+      .reply(404, { error: 'NotFound' });
+    const refund = nock(billing).post('/refunds', {
+      depositId: 'deposit-missing-hold',
+      amount: 50,
+      currency: 'USD'
+    }).reply(201, { id: 'refund-missing-hold', status: 'refunded' });
+
+    const response = await request(createApp({ db: pool, publishEvent: jest.fn() }))
+      .delete('/reservations/R-MISSING-HOLD');
+
+    expect(response.status).toBe(204);
+    expect(release.isDone()).toBe(true);
+    expect(refund.isDone()).toBe(true);
+
+    const row = await pool.query(
+      'SELECT status FROM reservations WHERE reservation_no = $1',
+      ['R-MISSING-HOLD']
     );
     expect(row.rows[0].status).toBe('cancelled');
   });

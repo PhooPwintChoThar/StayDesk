@@ -211,21 +211,15 @@ export function createApp({ db = pool, clock = () => new Date() } = {}) {
 
   app.delete('/holds/:id', async (req, res, next) => {
     try {
-      const result = await db.query('SELECT status FROM holds WHERE id = $1', [req.params.id]);
-
-      if (result.rowCount === 0) {
-        return errorResponse(res, 404, 'NotFound', 'Hold not found.');
-      }
-
-      if (result.rows[0].status === 'confirmed') {
-        return errorResponse(res, 409, 'Conflict', 'Confirmed holds cannot be released.');
-      }
-
-      await db.query(
-        "UPDATE holds SET status = 'released' WHERE id = $1 AND status = 'held'",
+      const released = await db.query(
+        "UPDATE holds SET status = 'released' WHERE id = $1 AND status IN ('held', 'confirmed') RETURNING id",
         [req.params.id]
       );
-      return res.status(204).end();
+      if (released.rowCount) return res.status(204).end();
+
+      const exists = await db.query('SELECT 1 FROM holds WHERE id = $1', [req.params.id]);
+      if (!exists.rowCount) return errorResponse(res, 404, 'NotFound', 'Hold not found.');
+      return errorResponse(res, 409, 'Conflict', 'Hold already released.');
     } catch (error) {
       return next(error);
     }

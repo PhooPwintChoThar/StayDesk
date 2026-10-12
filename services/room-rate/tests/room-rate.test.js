@@ -109,6 +109,6 @@ describe('room-rate endpoints', () => {
     expect(confirmed.body.status).toBe('confirmed');
 
     const release = await request(app).delete(`/holds/${created.body.id}`);
-    expect(release.status).toBe(409);
+    expect(release.status).toBe(204);
   });
 });
