@@ -73,6 +73,16 @@ Quick check: `curl http://localhost:3010/health` should return `{"status":"ok"}`
 
 The gateway validates JWTs and enforces roles (`guest`, `agent`, `manager`). There is no real user database, so `POST /login {"role":"agent"}` returns a token for that role. The web app calls it automatically (`web/src/api.js`). `GET /availability` is public.
 
+## Day-to-day commands
+
+| Task | Command |
+|---|---|
+| Rebuild after changing a service | `docker compose up -d --build <service>` |
+| Apply compose env changes | `docker compose up -d --force-recreate <service>` |
+| Service logs | `docker compose logs --since 5m <service>` |
+| Open a database | `docker compose exec postgres psql -U postgres -d <db_name>` |
+| Reset everything (deletes data) | `docker compose down -v`, then redo steps 3-4 |
+| Web app changes | nothing, Vite hot-reloads |
 
 ## Tests
 
