@@ -8,6 +8,7 @@
     "test": "node --experimental-vm-modules ../../node_modules/jest/bin/jest.js --runInBand"
   },
   "dependencies": {
+    "amqplib": "^0.10.8",
     "express": "^5.1.0",
     "pg": "^8.16.0"
   },
