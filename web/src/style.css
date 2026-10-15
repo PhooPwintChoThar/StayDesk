@@ -9,7 +9,9 @@
   box-sizing: border-box;
 }
 
-html, body, #root {
+html,
+body,
+#root {
   margin: 0;
   min-height: 100%;
   height: 100%;
@@ -90,7 +92,9 @@ button:disabled {
   padding: 8px 10px;
   text-align: left;
   font-size: 0.95rem;
-  transition: background 0.2s ease, color 0.2s ease;
+  transition:
+    background 0.2s ease,
+    color 0.2s ease;
 }
 
 .nav-item.active {
@@ -312,6 +316,66 @@ tbody td {
   font-size: 1.2rem;
   color: #1d2430;
   line-height: 1;
+}
+
+.actions-cell {
+  position: relative;
+}
+
+.action-menu {
+  position: absolute;
+  right: 48px;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 5;
+  display: flex;
+  background: #ffffff;
+  border: 1px solid #dce1e8;
+  border-radius: 8px;
+  box-shadow: 0 6px 18px rgba(17, 25, 39, 0.12);
+  overflow: hidden;
+}
+
+.action-menu button {
+  border: none;
+  background: transparent;
+  text-align: left;
+  padding: 9px 12px;
+  color: #1d2430;
+}
+
+.action-menu button:hover:not(:disabled) {
+  background: #f1f4f7;
+}
+
+.action-menu button:disabled {
+  color: #a0a9b6;
+}
+
+.form-grid input,
+.form-grid select {
+  width: 100%;
+}
+
+tbody td {
+  white-space: nowrap;
+}
+
+.date-range {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.role-label {
+  font-size: 0.72rem;
+  color: #697589;
+}
+
+.register-panel h3 {
+  margin: 18px 0 10px;
+  font-size: 1rem;
+  color: #1f2937;
 }
 
 .pagination-row {
