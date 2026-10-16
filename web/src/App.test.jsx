@@ -103,6 +103,7 @@ describe("reservations management", () => {
           reservationNo: "R-10001",
           checkOut: "2027-03-12",
           totalAmount: 200,
+          depositAmount: 60,
         };
         reservations = [created];
         return reply(201, created);
@@ -125,22 +126,22 @@ describe("reservations management", () => {
     await userEvent.type(screen.getByLabelText("Email"), "guest@example.com");
     await userEvent.type(screen.getByLabelText("First name"), "Test");
     await userEvent.type(screen.getByLabelText("Last name"), "Guest");
-    await userEvent.type(screen.getByLabelText("Deposit amount"), "50");
     await userEvent.click(screen.getByRole("button", { name: "Book room" }));
 
     const confirmation = await screen.findByRole("status");
     expect(within(confirmation).getByText("R-10001")).toBeInTheDocument();
-    expect(JSON.parse(calls("POST", "/reservations")[0][1].body)).toMatchObject(
-      {
-        roomTypeId: "standard",
-        depositAmount: 50,
-        guest: {
-          email: "guest@example.com",
-          firstName: "Test",
-          lastName: "Guest",
-        },
+    const requestBody = JSON.parse(calls("POST", "/reservations")[0][1].body);
+    expect(requestBody).toMatchObject({
+      roomTypeId: "standard",
+      guest: {
+        email: "guest@example.com",
+        firstName: "Test",
+        lastName: "Guest",
       },
-    );
+    });
+    expect(requestBody).not.toHaveProperty("depositAmount");
+    expect(requestBody).not.toHaveProperty("currency");
+    expect(confirmation).toHaveTextContent("Deposit: 60 USD");
     expect(
       await within(screen.getByRole("table")).findByText("R-10001"),
     ).toBeInTheDocument();

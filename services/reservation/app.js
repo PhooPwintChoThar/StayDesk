@@ -3,6 +3,8 @@ import axios from "axios";
 import express from "express";
 import { pool } from "./db.js";
 
+const DEPOSIT_PERCENT = 30;
+
 const url = (names, fallback) => {
   for (const name of names) {
     if (process.env[name]) return process.env[name].replace(/\/$/, "");
@@ -41,6 +43,10 @@ function totalPrice(nightlyRate, checkIn, checkOut) {
     (Date.parse(`${checkOut}T00:00:00Z`) - Date.parse(`${checkIn}T00:00:00Z`)) /
     86_400_000;
   return Math.round(Number(nightlyRate) * nights * 100) / 100;
+}
+
+function depositPrice(amount) {
+  return Math.round((amount * DEPOSIT_PERCENT) / 100 * 100) / 100;
 }
 
 function fail(res, status, error, message) {
@@ -92,22 +98,18 @@ export function createApp({
   app.get("/health", (_req, res) => res.status(200).json({ status: "ok" }));
 
   app.post("/reservations", async (req, res, next) => {
-    const { guest, roomTypeId, checkIn, checkOut, depositAmount, currency } =
-      req.body ?? {};
+    const { guest, roomTypeId, checkIn, checkOut } = req.body ?? {};
 
     if (
       !guest ||
       !roomTypeId ||
-      !validDates(checkIn, checkOut) ||
-      !Number.isFinite(depositAmount) ||
-      depositAmount <= 0 ||
-      !/^[A-Z]{3}$/.test(currency ?? "")
+      !validDates(checkIn, checkOut)
     ) {
       return fail(
         res,
         400,
         "BadRequest",
-        "Valid guest, room type, dates, deposit, and currency are required.",
+        "Valid guest, room type, and dates are required.",
       );
     }
 
@@ -115,6 +117,8 @@ export function createApp({
     let holdId;
     let guestId;
     let depositId;
+    let depositAmount;
+    let currency;
     let saved = false;
 
     try {
@@ -138,6 +142,8 @@ export function createApp({
       }
 
       const amount = totalPrice(availability.nightlyRate, checkIn, checkOut);
+      depositAmount = depositPrice(amount);
+      currency = availability.currency;
       const holdResult = await http.post(`${roomRateUrl()}/holds`, {
         roomTypeId,
         checkIn,
@@ -210,6 +216,7 @@ export function createApp({
         checkIn,
         checkOut,
         totalAmount: amount,
+        depositAmount,
         currency,
         status: "confirmed",
       });

@@ -122,7 +122,6 @@ docker-compose.yml
 
 ## Known issues and open items
 
-- Deposit shown as 360 USD for a 120 USD booking: check what `web/src/App.jsx` sends as `depositAmount`.
 - Modify checks availability before releasing the old hold, so shifting to overlapping dates on a 1-room type returns 409.
 - Billing and the payment gateway are stubs; the deposit is not adjusted when a modification changes the price.
 - Notification only logs a test email. No templates.

@@ -14,8 +14,6 @@ const reservationPayload = {
   guest: { email: "guest@example.com", firstName: "Test", lastName: "Guest" },
   roomTypeId: "standard",
   ...dates,
-  depositAmount: 50,
-  currency: "USD",
 };
 
 beforeAll(async () => {
@@ -52,6 +50,7 @@ describe("reservation endpoints", () => {
             available: true,
             roomsAvailable: 1,
             nightlyRate: 100,
+            currency: "USD",
           },
         ],
       });
@@ -60,9 +59,11 @@ describe("reservation endpoints", () => {
       .post("/guests/get-or-create")
       .reply(201, { id: "guest-1" });
     nock(billing)
-      .post(
-        "/deposits",
-        (body) => body.reservationNo && body.guestId === "guest-1",
+      .post("/deposits", (body) =>
+        body.reservationNo &&
+        body.guestId === "guest-1" &&
+        body.amount === 60 &&
+        body.currency === "USD",
       )
       .reply(201, { id: "deposit-1", status: "authorized" });
     nock(roomRate)
@@ -71,13 +72,15 @@ describe("reservation endpoints", () => {
 
     const response = await request(app)
       .post("/reservations")
-      .send(reservationPayload);
+      .send({ ...reservationPayload, depositAmount: 999, currency: "THB" });
 
     expect(response.status).toBe(201);
     expect(response.body).toMatchObject({
       guestId: "guest-1",
       roomTypeId: "standard",
       totalAmount: 200,
+      depositAmount: 60,
+      currency: "USD",
       status: "confirmed",
     });
     expect(publishEvent).toHaveBeenCalledWith(
@@ -86,6 +89,11 @@ describe("reservation endpoints", () => {
         guestId: "guest-1",
       }),
     );
+    const stored = await pool.query(
+      "SELECT deposit_amount::float AS \"depositAmount\", currency FROM reservations WHERE reservation_no = $1",
+      [response.body.reservationNo],
+    );
+    expect(stored.rows[0]).toEqual({ depositAmount: 60, currency: "USD" });
   });
 
   it("releases the hold and returns 402 when billing declines", async () => {
@@ -99,6 +107,7 @@ describe("reservation endpoints", () => {
             available: true,
             roomsAvailable: 1,
             nightlyRate: 100,
+            currency: "USD",
           },
         ],
       });

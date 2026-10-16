@@ -34,8 +34,6 @@ export default function App() {
   const [availability, setAvailability] = useState([]);
   const [selectedRoom, setSelectedRoom] = useState(null);
   const [guest, setGuest] = useState(initialGuest);
-  const [depositAmount, setDepositAmount] = useState("");
-  const [currency, setCurrency] = useState("USD");
   const [confirmation, setConfirmation] = useState(null);
 
   const [guestQuery, setGuestQuery] = useState("");
@@ -85,7 +83,6 @@ export default function App() {
     setAvailability([]);
     setSelectedRoom(null);
     setGuest(initialGuest);
-    setDepositAmount("");
     setConfirmation(null);
     setError("");
   }
@@ -128,8 +125,6 @@ export default function App() {
           roomTypeId: selectedRoom.roomTypeId,
           checkIn: search.checkIn,
           checkOut: search.checkOut,
-          depositAmount: Number(depositAmount),
-          currency,
         }),
       });
       setConfirmation(reservation);
@@ -432,7 +427,7 @@ export default function App() {
 
                 {selectedRoom && (
                   <>
-                    <h3 id="booking-heading">Guest and deposit details</h3>
+                    <h3 id="booking-heading">Guest details</h3>
                     <form onSubmit={bookRoom} className="form-grid">
                       <label>
                         Email
@@ -477,30 +472,6 @@ export default function App() {
                           }
                         />
                       </label>
-                      <label>
-                        Deposit amount
-                        <input
-                          type="number"
-                          min="0.01"
-                          step="0.01"
-                          required
-                          value={depositAmount}
-                          onChange={(event) =>
-                            setDepositAmount(event.target.value)
-                          }
-                        />
-                      </label>
-                      <label>
-                        Currency
-                        <select
-                          value={currency}
-                          onChange={(event) => setCurrency(event.target.value)}
-                        >
-                          <option value="USD">USD</option>
-                          <option value="THB">THB</option>
-                          <option value="EUR">EUR</option>
-                        </select>
-                      </label>
                       <button
                         disabled={busy}
                         type="submit"
@@ -522,6 +493,9 @@ export default function App() {
                     <p>
                       Total: {confirmation.totalAmount} {confirmation.currency}
                       {" · "}Status: {confirmation.status}
+                    </p>
+                    <p>
+                      Deposit: {confirmation.depositAmount} {confirmation.currency}
                     </p>
                   </section>
                 )}

@@ -262,13 +262,14 @@ paths:
     post:
       operationId: createReservation
       tags: [reservation]
+      description: The deposit is calculated as 30% of the total price in the availability currency.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [guest, roomTypeId, checkIn, checkOut, depositAmount, currency]
+              required: [guest, roomTypeId, checkIn, checkOut]
               properties:
                 guest:
                   $ref: "#/components/schemas/GuestInput"
@@ -280,12 +281,6 @@ paths:
                 checkOut:
                   type: string
                   format: date
-                depositAmount:
-                  type: number
-                  exclusiveMinimum: 0
-                currency:
-                  type: string
-                  pattern: "^[A-Z]{3}$"
       responses:
         "201":
           description: Reservation created
@@ -467,7 +462,7 @@ components:
 
     Reservation:
       type: object
-      required: [reservationNo, guestId, roomTypeId, checkIn, checkOut, status]
+      required: [reservationNo, guestId, roomTypeId, checkIn, checkOut, totalAmount, depositAmount, currency, status]
       properties:
         reservationNo:
           type: string
@@ -481,6 +476,13 @@ components:
         checkOut:
           type: string
           format: date
+        totalAmount:
+          type: number
+        depositAmount:
+          type: number
+        currency:
+          type: string
+          pattern: "^[A-Z]{3}$"
         status:
           type: string
           enum: [confirmed, cancelled]
