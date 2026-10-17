@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { apiRequest } from "./api.js";
 import BookingDetails from "./BookingDetails.jsx";
+import { useErrorToast } from "./toast.js";
 
 const STATUS_LABELS = { pending: "pending payment", confirmed: "confirmed", cancelled: "cancelled" };
 
@@ -33,6 +34,7 @@ export default function GuestsScreen({ role, typeName = (id) => id }) {
   const [bookings, setBookings] = useState([]);
   const [bookingsState, setBookingsState] = useState("idle");
   const [details, setDetails] = useState(null);
+  useErrorToast(error, setError);
 
   const load = useCallback(async (search = "") => {
     setState("loading");
@@ -136,7 +138,6 @@ export default function GuestsScreen({ role, typeName = (id) => id }) {
           )}
         </form>
 
-        {error && <p role="alert" className="error">{error}</p>}
         {state === "loading" && <p className="muted">Loading guests…</p>}
 
         {state === "ready" && (

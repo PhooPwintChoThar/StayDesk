@@ -1399,3 +1399,21 @@ tbody td.wrap-cell {
   background: #eceff1;
   color: #4b5a63;
 }
+
+.toast-error {
+  border-left-color: var(--red);
+}
+
+.toast-error .toast-title,
+.toast-error .toast-timer {
+  color: var(--red);
+  background: var(--red);
+}
+
+.toast-error .toast-title {
+  background: none;
+}
+
+.toast-error .toast-body p:first-child {
+  color: var(--red);
+}

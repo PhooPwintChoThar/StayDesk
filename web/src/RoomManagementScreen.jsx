@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useState } from "react";
 import { apiRequest, assetUrl } from "./api.js";
-import { showToast } from "./toast.js";
+import { showToast, useErrorToast } from "./toast.js";
 
 const NEW_TYPE = "__new__";
 
@@ -243,6 +243,7 @@ export default function RoomManagementScreen() {
   const [photosFor, setPhotosFor] = useState(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  useErrorToast(error, setError);
 
   const load = useCallback(async () => {
     try {
@@ -419,7 +420,6 @@ export default function RoomManagementScreen() {
 
   return (
     <>
-      {error && <p role="alert" className="error">{error}</p>}
 
       <section aria-labelledby="add-room-heading" className="register-panel">
         <div className="register-header">

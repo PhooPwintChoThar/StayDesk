@@ -17,7 +17,7 @@ import RoomCards from "./RoomCards.jsx";
 import BookingDetails from "./BookingDetails.jsx";
 import GuestsScreen from "./GuestsScreen.jsx";
 import Toaster from "./Toaster.jsx";
-import { showToast } from "./toast.js";
+import { showToast, useErrorToast } from "./toast.js";
 
 const DEV_ROLE_SWITCH = import.meta.env.VITE_DEV_ROLE_SWITCH === "true";
 
@@ -382,6 +382,7 @@ export default function App() {
 
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  useErrorToast(error, setError);
   const sessionRef = useRef(session);
   sessionRef.current = session;
 
@@ -928,11 +929,6 @@ export default function App() {
           </div>
         </header>
 
-        {error && (
-          <p role="alert" className="error">
-            {error}
-          </p>
-        )}
         {detailsFor && (
           <BookingDetails
             reservationNo={detailsFor.reservationNo}

@@ -46,4 +46,27 @@ describe("pop-up notifications", () => {
     expect(screen.getAllByRole("status")).toHaveLength(1);
     expect(screen.getByRole("status")).toHaveTextContent("Second");
   });
+
+  it("shows errors as red alerts that stay longer", () => {
+    vi.useFakeTimers();
+    render(<Toaster />);
+
+    act(() => {
+      showToast("Room 301 is reserved during that period (2026-10-18 to 2026-10-19).", { tone: "error" });
+    });
+
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveClass("toast-error");
+    expect(alert).toHaveTextContent("Room 301 is reserved during that period");
+
+    act(() => {
+      vi.advanceTimersByTime(7000);
+    });
+    expect(screen.queryByRole("alert")).toBeInTheDocument();
+    act(() => {
+      vi.advanceTimersByTime(1100);
+    });
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
 });
+

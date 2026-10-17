@@ -56,7 +56,7 @@ export default function MyProfileScreen({ session }) {
       setProfile(updated);
       showToast("Your profile has been saved.", { title: "Profile updated" });
     } catch (err) {
-      setError(err.message);
+      showToast(err.message, { tone: "error" });
     } finally {
       setBusy(false);
     }
@@ -78,11 +78,6 @@ export default function MyProfileScreen({ session }) {
       {state === "loading" && <p className="muted">Loading your profile…</p>}
       {state === "missing" && <p>No guest profile is linked to this account.</p>}
       {state === "error" && (
-        <p role="alert" className="error">
-          {error}
-        </p>
-      )}
-      {error && state === "ready" && (
         <p role="alert" className="error">
           {error}
         </p>

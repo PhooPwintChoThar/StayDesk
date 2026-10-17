@@ -10,7 +10,11 @@ export default function Toaster() {
   return (
     <div className="toast-stack" aria-live="polite">
       {toasts.map((toast) => (
-        <div key={toast.id} role="status" className="toast">
+        <div
+          key={toast.id}
+          role={toast.tone === "error" ? "alert" : "status"}
+          className={`toast ${toast.tone === "error" ? "toast-error" : ""}`}
+        >
           <div className="toast-body">
             {toast.title && <strong className="toast-title">{toast.title}</strong>}
             {toast.lines.map((line, index) => (

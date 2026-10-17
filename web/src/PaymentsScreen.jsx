@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { apiBlob, apiRequest } from "./api.js";
-import { showToast } from "./toast.js";
+import { showToast, useErrorToast } from "./toast.js";
 
 export const MAX_PROOF_BYTES = 5 * 1024 * 1024;
 const ALLOWED_TYPES = ["image/png", "image/jpeg", "application/pdf"];
@@ -210,6 +210,7 @@ function GuestPayments({ session }) {
   const [fileKey, setFileKey] = useState(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  useErrorToast(error, setError);
   const [viewing, setViewing] = useState(null);
 
   // The gateway returns only this guest's reservations; the filter below is a
@@ -365,12 +366,6 @@ function GuestPayments({ session }) {
           <p className="muted">Upload proof of payment and follow its review</p>
         </div>
       </div>
-
-      {error && (
-        <p role="alert" className="error">
-          {error}
-        </p>
-      )}
 
       {listState === "loading" && <p className="muted">Loading your reservations…</p>}
       {listState === "ready" && reservations.length === 0 && (
@@ -528,6 +523,7 @@ function StaffPayments() {
   const [proofs, setProofs] = useState([]);
   const [state, setState] = useState("loading");
   const [error, setError] = useState("");
+  useErrorToast(error, setError);
   const [rejectingId, setRejectingId] = useState(null);
   const [rejectNote, setRejectNote] = useState("");
   const [reviewingId, setReviewingId] = useState(null);
@@ -652,12 +648,6 @@ function StaffPayments() {
           </button>
         </div>
       </form>
-
-      {error && (
-        <p role="alert" className="error">
-          {error}
-        </p>
-      )}
 
       {state === "loading" && <p className="muted">Loading payment proofs…</p>}
       {state === "ready" && proofs.length === 0 && (
