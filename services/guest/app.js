@@ -37,6 +37,22 @@ function errorResponse(res, status, error, message) {
   return res.status(status).json({ error, message });
 }
 
+function actorFromRequest(req) {
+  return {
+    id: req.headers['x-user-id'] || null,
+    role: req.headers['x-user-role'] || 'agent',
+  };
+}
+
+function serializeGuest(row, actor) {
+  const isOwner = actor.role === 'guest' && actor.id === row.id;
+  const canSeeFullDocument = actor.role === 'manager' || isOwner;
+  return {
+    ...row,
+    idDocument: canSeeFullDocument ? row.idDocument : maskDocument(row.idDocument),
+  };
+}
+
 function isUniqueViolation(error) {
   return error.code === '23505';
 }
@@ -174,6 +190,7 @@ export function createApp({ db = pool } = {}) {
     if (built.error) {
       return errorResponse(res, 400, 'BadRequest', built.error);
     }
+    const actor = actorFromRequest(req);
 
     const guest = built.guest;
     let client;
@@ -200,7 +217,7 @@ export function createApp({ db = pool } = {}) {
 
       if (found.rowCount) {
         await client.query('COMMIT');
-        return res.status(200).json(found.rows[0]);
+        return res.status(200).json(serializeGuest(found.rows[0], actor));
       }
 
       const created = await client.query(
@@ -214,7 +231,7 @@ export function createApp({ db = pool } = {}) {
       );
 
       await client.query('COMMIT');
-      return res.status(201).json(created.rows[0]);
+      return res.status(201).json(serializeGuest(created.rows[0], actor));
     } catch (error) {
       if (client) await client.query('ROLLBACK').catch(() => {});
       if (isUniqueViolation(error)) {
@@ -233,6 +250,7 @@ export function createApp({ db = pool } = {}) {
     }
 
     try {
+      const actor = actorFromRequest(req);
       const result = await db.query(
         `SELECT ${guestFields}
          FROM guests
@@ -245,7 +263,7 @@ export function createApp({ db = pool } = {}) {
         [`%${query}%`]
       );
 
-      return res.status(200).json({ guests: result.rows });
+      return res.status(200).json({ guests: result.rows.map((row) => serializeGuest(row, actor)) });
     } catch (error) {
       return next(error);
     }
@@ -271,6 +289,7 @@ export function createApp({ db = pool } = {}) {
 
   app.get('/guests/:id/export', async (req, res, next) => {
     try {
+      const actor = actorFromRequest(req);
       const result = await db.query(
         `SELECT ${guestFields} FROM guests WHERE id = $1`,
         [req.params.id]
@@ -279,7 +298,7 @@ export function createApp({ db = pool } = {}) {
         return errorResponse(res, 404, 'NotFound', 'Guest not found.');
       }
       return res.status(200).json({
-        guest: result.rows[0],
+        guest: serializeGuest(result.rows[0], actor),
         exportedAt: new Date().toISOString()
       });
     } catch (error) {
@@ -289,6 +308,7 @@ export function createApp({ db = pool } = {}) {
 
   app.get('/guests/:id', async (req, res, next) => {
     try {
+      const actor = actorFromRequest(req);
       const result = await db.query(
         `SELECT ${guestFields} FROM guests WHERE id = $1`,
         [req.params.id]
@@ -296,7 +316,7 @@ export function createApp({ db = pool } = {}) {
       if (!result.rowCount) {
         return errorResponse(res, 404, 'NotFound', 'Guest not found.');
       }
-      return res.status(200).json(result.rows[0]);
+      return res.status(200).json(serializeGuest(result.rows[0], actor));
     } catch (error) {
       return next(error);
     }
@@ -307,9 +327,24 @@ export function createApp({ db = pool } = {}) {
     if (built.error) {
       return errorResponse(res, 400, 'BadRequest', built.error);
     }
+    const actor = actorFromRequest(req);
+    const loyaltyTierProvided = Object.prototype.hasOwnProperty.call(req.body ?? {}, 'loyaltyTier');
 
     try {
       const guest = built.guest;
+      const current = await db.query(
+        `SELECT ${guestFields} FROM guests WHERE id = $1`,
+        [req.params.id]
+      );
+      if (!current.rowCount) {
+        return errorResponse(res, 404, 'NotFound', 'Guest not found.');
+      }
+      if (actor.role !== 'manager' && loyaltyTierProvided && guest.loyaltyTier !== current.rows[0].loyaltyTier) {
+        return errorResponse(res, 403, 'Forbidden', 'Only managers can change loyalty tier.');
+      }
+      if (actor.role !== 'manager' && !loyaltyTierProvided) {
+        guest.loyaltyTier = current.rows[0].loyaltyTier;
+      }
       const result = await db.query(
         `UPDATE guests
          SET email = $2, first_name = $3, last_name = $4, phone = $5,
@@ -325,7 +360,7 @@ export function createApp({ db = pool } = {}) {
       if (!result.rowCount) {
         return errorResponse(res, 404, 'NotFound', 'Guest not found.');
       }
-      return res.status(200).json(result.rows[0]);
+      return res.status(200).json(serializeGuest(result.rows[0], actor));
     } catch (error) {
       if (isUniqueViolation(error)) {
         return errorResponse(res, 409, 'Conflict', 'A guest with that email, phone, or loyalty number already exists.');

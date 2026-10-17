@@ -229,6 +229,17 @@ export default function App() {
   const [hotels, setHotels] = useState([]);
   const [lookupNo, setLookupNo] = useState("");
   const [lookedUp, setLookedUp] = useState(null);
+  const [myProfile, setMyProfile] = useState(null);
+  const [myProfileError, setMyProfileError] = useState("");
+  const [myProfileBusy, setMyProfileBusy] = useState(false);
+  const [paymentReservationNo, setPaymentReservationNo] = useState("");
+  const [paymentSummary, setPaymentSummary] = useState(null);
+  const [paymentProofs, setPaymentProofs] = useState([]);
+  const [paymentNote, setPaymentNote] = useState("");
+  const [paymentAmount, setPaymentAmount] = useState("");
+  const [paymentFile, setPaymentFile] = useState(null);
+  const [paymentBusy, setPaymentBusy] = useState(false);
+  const [paymentError, setPaymentError] = useState("");
 
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -315,13 +326,12 @@ export default function App() {
     if (filters.status) params.set("status", filters.status);
     if (filters.from) params.set("from", filters.from);
     if (filters.to) params.set("to", filters.to);
+    if (sessionRef.current?.claims?.role === "guest") {
+      params.set("guestId", sessionRef.current.claims.guestId);
+    }
 
     try {
       const result = await apiRequest(`/reservations?${params}`);
-      if (sessionRef.current?.claims?.role === "guest") {
-        setReservations([]);
-        return;
-      }
       setReservations(result.reservations || []);
     } catch (err) {
       setReservations([]);
@@ -329,9 +339,61 @@ export default function App() {
     }
   }, [filters.status, filters.from, filters.to]);
 
+  const loadMyProfile = useCallback(async () => {
+    if (!sessionRef.current?.claims?.guestId) return;
+    setMyProfileBusy(true);
+    setMyProfileError("");
+    try {
+      const result = await apiRequest(`/guests/${encodeURIComponent(sessionRef.current.claims.guestId)}`);
+      setMyProfile(result);
+    } catch (err) {
+      setMyProfileError(err.message);
+    } finally {
+      setMyProfileBusy(false);
+    }
+  }, []);
+
+  const loadPayments = useCallback(async () => {
+    setPaymentError("");
+    setPaymentSummary(null);
+    setPaymentProofs([]);
+
+    try {
+      if (sessionRef.current?.claims?.role === "guest") {
+        const guestReservations = await apiRequest(`/reservations?guestId=${encodeURIComponent(sessionRef.current.claims.guestId)}`);
+        const firstReservation = guestReservations.reservations?.[0]?.reservationNo || "";
+        if (!firstReservation) return;
+        setPaymentReservationNo(firstReservation);
+        const [summary, proofs] = await Promise.all([
+          apiRequest(`/reservations/${encodeURIComponent(firstReservation)}/payment-summary`),
+          apiRequest(`/payments/proofs?reservationNo=${encodeURIComponent(firstReservation)}`),
+        ]);
+        setPaymentSummary(summary);
+        setPaymentProofs(proofs.proofs || []);
+      } else {
+        const proofs = await apiRequest('/payments/proofs?status=pending');
+        setPaymentProofs(proofs.proofs || []);
+      }
+    } catch (err) {
+      setPaymentError(err.message);
+    }
+  }, []);
+
   useEffect(() => {
     if (session && view === "reservations") loadReservations();
   }, [session, view, loadReservations]);
+
+  useEffect(() => {
+    if (session && view === "profile" && session.claims.role === "guest") {
+      loadMyProfile();
+    }
+  }, [session, view, loadMyProfile]);
+
+  useEffect(() => {
+    if (session && view === "payments") {
+      loadPayments();
+    }
+  }, [session, view, loadPayments]);
 
   async function changeRole(nextRole) {
     setDevRole(nextRole);
@@ -573,6 +635,106 @@ export default function App() {
       }
     } catch (err) {
       setError(err.message);
+    }
+  }
+
+  async function saveMyProfile(event) {
+    event.preventDefault();
+    if (!myProfile) return;
+
+    setMyProfileBusy(true);
+    setMyProfileError("");
+    try {
+      const result = await apiRequest(`/guests/${encodeURIComponent(myProfile.id)}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          email: myProfile.email,
+          firstName: myProfile.firstName,
+          lastName: myProfile.lastName,
+          phone: myProfile.phone || "",
+          address: myProfile.address || "",
+          idDocument: myProfile.idDocument || "",
+          preferences: myProfile.preferences || "",
+          loyaltyTier: myProfile.loyaltyTier || "none",
+          loyaltyNumber: myProfile.loyaltyNumber || "",
+          consent: true,
+        }),
+      });
+      setMyProfile(result);
+    } catch (err) {
+      setMyProfileError(err.message);
+    } finally {
+      setMyProfileBusy(false);
+    }
+  }
+
+  async function uploadProof(event) {
+    event.preventDefault();
+    if (!paymentReservationNo || !paymentFile) return;
+
+    setPaymentBusy(true);
+    setPaymentError("");
+    try {
+      const token = session?.token;
+      const formData = new FormData();
+      formData.append("reservationNo", paymentReservationNo);
+      formData.append("amount", paymentAmount || "0");
+      formData.append("currency", paymentSummary?.currency || "USD");
+      formData.append("note", paymentNote);
+      formData.append("file", paymentFile);
+
+      const response = await fetch(`${(import.meta.env.VITE_API_BASE_URL || "http://localhost:3010").replace(/\/$/, "")}/payments/proofs`, {
+        method: "POST",
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        body: formData,
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.message || data.error || "Upload failed");
+      setPaymentFile(null);
+      setPaymentNote("");
+      setPaymentAmount("");
+      await loadPayments();
+    } catch (err) {
+      setPaymentError(err.message);
+    } finally {
+      setPaymentBusy(false);
+    }
+  }
+
+  async function reviewProof(proofId, decision) {
+    setPaymentError("");
+    try {
+      const body = { decision };
+      if (decision === "rejected") {
+        const note = window.prompt("Rejection note");
+        if (!note) return;
+        body.note = note;
+      }
+      await apiRequest(`/payments/proofs/${encodeURIComponent(proofId)}/review`, {
+        method: "PUT",
+        body: JSON.stringify(body),
+      });
+      await loadPayments();
+    } catch (err) {
+      setPaymentError(err.message);
+    }
+  }
+
+  async function openProofFile(proofId) {
+    try {
+      const response = await fetch(`${(import.meta.env.VITE_API_BASE_URL || "http://localhost:3010").replace(/\/$/, "")}/payments/proofs/${encodeURIComponent(proofId)}/file`, {
+        headers: session?.token ? { Authorization: `Bearer ${session.token}` } : {},
+      });
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(data.message || data.error || "Unable to open file");
+      }
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      window.open(url, "_blank", "noopener,noreferrer");
+      setTimeout(() => URL.revokeObjectURL(url), 10_000);
+    } catch (err) {
+      setPaymentError(err.message);
     }
   }
 

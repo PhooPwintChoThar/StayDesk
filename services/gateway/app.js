@@ -3,6 +3,7 @@ import express from 'express';
 import jwt from 'jsonwebtoken';
 import cors from 'cors';
 import bcrypt from 'bcryptjs';
+import { Readable } from 'node:stream';
 import { ROLES, buildGatewayChain, isOwnershipRoute } from './auth-chain.js';
 
 const INTERNAL_TOKEN = process.env.INTERNAL_TOKEN;

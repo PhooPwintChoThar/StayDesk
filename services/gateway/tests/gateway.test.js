@@ -8,6 +8,7 @@ const secret = 'gateway-test-secret';
 const roomRateUrl = 'http://room-rate.test';
 const reservationUrl = 'http://reservation.test';
 const guestUrl = 'http://guest.test';
+const billingUrl = 'http://billing.test';
 
 function token(role) {
   return jwt.sign({ role }, secret);
@@ -22,6 +23,7 @@ describe('gateway authentication and proxying', () => {
     process.env.ROOM_RATE_SERVICE_URL = roomRateUrl;
     process.env.RESERVATION_SERVICE_URL = reservationUrl;
     process.env.GUEST_SERVICE_URL = guestUrl;
+    process.env.BILLING_SERVICE_URL = billingUrl;
     process.env.USERS_JSON = JSON.stringify([
       {
         username: 'agent',
@@ -192,6 +194,29 @@ describe('gateway authentication and proxying', () => {
       roomTypeId: 'standard',
       available: true
     });
+    expect(upstream.isDone()).toBe(true);
+  });
+
+  it('forwards multipart payment proof uploads intact', async () => {
+    const app = createApp({ secret });
+    const upstream = nock(billingUrl)
+      .post('/payments/proofs', (body) => {
+        const text = typeof body === 'string' ? body : Buffer.isBuffer(body) ? body.toString('utf8') : '';
+        return text.includes('R-10001') && text.includes('proof.pdf');
+      })
+      .matchHeader('content-type', (value) => String(value).includes('multipart/form-data'))
+      .reply(201, { id: 'proof-1', status: 'pending' });
+
+    const response = await request(app)
+      .post('/payments/proofs')
+      .set('Authorization', `Bearer ${token('guest')}`)
+      .field('reservationNo', 'R-10001')
+      .field('amount', '42.50')
+      .field('currency', 'USD')
+      .attach('file', Buffer.from('proof-bytes'), 'proof.pdf');
+
+    expect(response.status).toBe(201);
+    expect(response.body).toMatchObject({ status: 'pending' });
     expect(upstream.isDone()).toBe(true);
   });
 });

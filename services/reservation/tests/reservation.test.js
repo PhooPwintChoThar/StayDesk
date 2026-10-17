@@ -201,6 +201,34 @@ describe("reservation endpoints", () => {
     });
   });
 
+  it('returns a payment summary that includes approved proof totals', async () => {
+    await pool.query(
+      `INSERT INTO reservations
+        (reservation_no, guest_id, room_type_id, hold_id, check_in, check_out,
+         total_amount, deposit_id, deposit_amount, deposit_net, currency, status)
+       VALUES ('R-SUMMARY', 'guest-1', 'standard', 'hold-summary', $1, $2,
+               200, 'deposit-summary', 50, 50, 'USD', 'confirmed')`,
+      [dates.checkIn, dates.checkOut],
+    );
+
+    nock(billing)
+      .get('/payments/proofs')
+      .query({ reservationNo: 'R-SUMMARY', status: 'approved' })
+      .reply(200, { proofs: [{ amount: 10 }, { amount: 7.5 }] });
+
+    const response = await request(createApp({ db: pool, publishEvent: jest.fn() }))
+      .get('/reservations/R-SUMMARY/payment-summary');
+
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({
+      totalAmount: 200,
+      depositHeld: 50,
+      approvedProofsTotal: 17.5,
+      balanceDue: 132.5,
+      currency: 'USD',
+    });
+  });
+
   it("skips the refund when the none cancellation policy is configured", async () => {
     await pool.query(
       `INSERT INTO reservations

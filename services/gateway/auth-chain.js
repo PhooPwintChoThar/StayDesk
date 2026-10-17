@@ -19,6 +19,9 @@ export function serviceForPath(path) {
   if (path === "/deposits" || path === "/refunds") {
     return ["BILLING_SERVICE_URL", "http://billing:3000"];
   }
+  if (path === "/payments" || path.startsWith("/payments/")) {
+    return ["BILLING_SERVICE_URL", "http://billing:3000"];
+  }
   if (path === "/reservations" || path.startsWith("/reservations/")) {
     return ["RESERVATION_SERVICE_URL", "http://reservation:3000"];
   }
@@ -41,7 +44,10 @@ export function allowedForGuest(method, path) {
       /^\/reservations\/[^/]+$/.test(path)) ||
     (method === "POST" && path === "/guests/get-or-create") ||
     (method === "GET" && /^\/guests\/[^/]+$/.test(path)) ||
-    (method === "PUT" && /^\/guests\/[^/]+$/.test(path))
+    (method === "PUT" && /^\/guests\/[^/]+$/.test(path)) ||
+    (method === "POST" && path === "/payments/proofs") ||
+    (method === "GET" && path === "/payments/proofs") ||
+    (method === "GET" && /^\/payments\/proofs\/[^/]+\/file$/.test(path))
   );
 }
 
@@ -126,6 +132,7 @@ export class RouteHandler extends Handler {
     const { req, res, service } = ctx;
     const [envName, fallback] = service;
     const baseUrl = (process.env[envName] || fallback).replace(/\/$/, "");
+    const isProofUpload = req.method === "POST" && req.path === "/payments/proofs" && req.headers["content-type"]?.includes("multipart/form-data");
 
     if (ctx.role === "guest" && ctx.claims?.guestId && isOwnershipRoute(req.path)) {
       const owns = await this.isOwner(ctx, baseUrl);
@@ -138,9 +145,10 @@ export class RouteHandler extends Handler {
       const response = await this.http.request({
         method: req.method,
         url: `${baseUrl}${req.originalUrl}`,
-        data: req.body,
+        data: isProofUpload ? req : req.body,
         headers: {
           "content-type": req.headers["content-type"] || "application/json",
+          ...(isProofUpload && req.headers["content-length"] ? { "content-length": req.headers["content-length"] } : {}),
           ...(ctx.claims?.sub || ctx.claims?.guestId ? { "x-user-id": ctx.claims.sub || ctx.claims.guestId } : {}),
           ...(ctx.role ? { "x-user-role": ctx.role } : {}),
           ...(process.env.INTERNAL_TOKEN ? { "x-internal-token": process.env.INTERNAL_TOKEN } : {}),
@@ -148,6 +156,8 @@ export class RouteHandler extends Handler {
             ? { "x-request-id": req.headers["x-request-id"] }
             : {}),
         },
+        maxBodyLength: Infinity,
+        maxContentLength: Infinity,
         validateStatus: () => true,
       });
 

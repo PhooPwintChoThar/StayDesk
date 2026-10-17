@@ -1,6 +1,7 @@
 import { createNotifier } from './channels.js';
 
 export const QUEUE_NAME = 'ReservationConfirmed';
+export const QUEUE_NAMES = ['ReservationConfirmed', 'ReservationModified', 'ReservationCancelled'];
 
 const required = [
   'reservationNo',
@@ -28,9 +29,9 @@ export async function handleReservationConfirmed(payload, notifier) {
   await adapter.notify(payload);
 }
 
-export async function startConsumer(channel, notifier) {
-  await channel.assertQueue(QUEUE_NAME, { durable: true });
-  await channel.consume(QUEUE_NAME, async (message) => {
+export async function startConsumer(channel, notifier, queueName = QUEUE_NAME) {
+  await channel.assertQueue(queueName, { durable: true });
+  await channel.consume(queueName, async (message) => {
     if (!message) return;
 
     try {
@@ -38,7 +39,7 @@ export async function startConsumer(channel, notifier) {
       await handleReservationConfirmed(payload, notifier);
       channel.ack(message);
     } catch (error) {
-      console.error('Failed to process ReservationConfirmed:', error);
+      console.error(`Failed to process ${queueName}:`, error);
       channel.nack(message, false, true);
     }
   });

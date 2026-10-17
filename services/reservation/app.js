@@ -216,6 +216,31 @@ async function refundAcrossSources({ http, reservationNo, sources, amount, curre
   return refunds;
 }
 
+async function loadApprovedProofsTotal(http, reservationNo) {
+  const response = await http.get(`${billingUrl()}/payments/proofs`, {
+    params: { reservationNo, status: 'approved' },
+  });
+  const proofs = Array.isArray(response.data?.proofs) ? response.data.proofs : [];
+  return proofs.reduce((sum, proof) => sum + Number(proof.amount || 0), 0);
+}
+
+function notificationPayload(reservation, extra = {}) {
+  return {
+    reservationNo: reservation.reservationNo,
+    guestId: reservation.guestId,
+    guestEmail: reservation.guestEmail ?? null,
+    guestPhone: reservation.guestPhone ?? null,
+    roomTypeId: reservation.roomTypeId,
+    checkIn: reservation.checkIn,
+    checkOut: reservation.checkOut,
+    totalAmount: Number(reservation.totalAmount),
+    currency: currencyValue(reservation),
+    channel: reservation.channel || extra.channel || "email",
+    confirmedAt: extra.confirmedAt || new Date().toISOString(),
+    event: extra.event || "ReservationConfirmed",
+  };
+}
+
 const reservationSelect = `
   reservation_no AS "reservationNo", guest_id AS "guestId",
   room_type_id AS "roomTypeId",
@@ -227,7 +252,7 @@ const reservationSelect = `
   currency, status, guests
 `;
 
-async function publishConfirmed(payload) {
+async function publishToQueue(queueName, payload) {
   const amqp = await import("amqplib");
   const connection = await amqp.connect(
     process.env.RABBITMQ_URL || "amqp://localhost:5672",
@@ -235,9 +260,9 @@ async function publishConfirmed(payload) {
 
   try {
     const channel = await connection.createChannel();
-    await channel.assertQueue("ReservationConfirmed", { durable: true });
+    await channel.assertQueue(queueName, { durable: true });
     channel.sendToQueue(
-      "ReservationConfirmed",
+      queueName,
       Buffer.from(JSON.stringify(payload)),
       { persistent: true, contentType: "application/json" },
     );
@@ -247,10 +272,23 @@ async function publishConfirmed(payload) {
   }
 }
 
+async function publishConfirmed(payload) {
+  return publishToQueue("ReservationConfirmed", payload);
+}
+
+async function publishBestEffort(queueName, payload) {
+  try {
+    await publishToQueue(queueName, payload);
+  } catch (error) {
+    console.error(error);
+  }
+}
+
 export function createApp({
   db = pool,
   http = axios,
   publishEvent = publishConfirmed,
+  publishNotification = process.env.RABBITMQ_URL ? publishBestEffort : async () => {},
   cancellationPolicy = createCancellationPolicy(),
 } = {}) {
   const app = express();
@@ -443,7 +481,7 @@ export function createApp({
         },
         {
           async execute(ctx) {
-            await publishEvent({
+            await publishEvent(notificationPayload({
               reservationNo,
               guestId: ctx.guestId,
               guestEmail: ctx.guestEmail,
@@ -454,8 +492,7 @@ export function createApp({
               totalAmount: ctx.amount,
               currency: ctx.currency,
               channel: channel === "sms" ? "sms" : "email",
-              confirmedAt: new Date().toISOString(),
-            });
+            }));
           },
         },
       ]);
@@ -540,8 +577,7 @@ export function createApp({
       const checkIn = new Date(`${reservation.checkIn}T00:00:00Z`);
       const hoursBeforeCheckIn = Math.max(0, Math.round((checkIn.getTime() - now.getTime()) / 3_600_000));
       const percent = cancellationPolicy.refundPercent(reservation.checkIn, now);
-      const refundAmount = Math.round((heldAmount * percent) * 100) / 10000;
-      const feeAmount = Math.round((heldAmount - refundAmount) * 100) / 100;
+      const { refundAmount, feeAmount } = quoteFromHours(hoursBeforeCheckIn, heldAmount, percent);
 
       return res.status(200).json({
         refundAmount,
@@ -549,6 +585,29 @@ export function createApp({
         currency: currencyValue(reservation),
         rule: cancellationPolicy.name || "full",
         hoursBeforeCheckIn,
+      });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  app.get("/reservations/:no/payment-summary", async (req, res, next) => {
+    try {
+      const reservation = await loadReservation(db, req.params.no);
+      if (!reservation) {
+        return fail(res, 404, "NotFound", "Reservation not found.");
+      }
+
+      const approvedProofsTotal = await loadApprovedProofsTotal(http, req.params.no);
+      const heldAmount = depositHeldValue(reservation);
+      const balanceDue = Math.max(0, Math.round((Number(reservation.totalAmount) - heldAmount - approvedProofsTotal) * 100) / 100);
+
+      return res.status(200).json({
+        totalAmount: Number(reservation.totalAmount),
+        depositHeld: heldAmount,
+        approvedProofsTotal: Math.round(approvedProofsTotal * 100) / 100,
+        balanceDue,
+        currency: currencyValue(reservation),
       });
     } catch (error) {
       return next(error);
@@ -709,6 +768,15 @@ export function createApp({
               }
 
               await client.query('COMMIT');
+              await publishNotification('ReservationModified', notificationPayload({
+                reservationNo: req.params.no,
+                guestId: current.guest_id,
+                roomTypeId,
+                checkIn,
+                checkOut,
+                totalAmount: ctx.amount,
+                currency: current.currency,
+              }, { event: 'ReservationModified' }));
               return { updated: updated.rows[0] };
             } catch (error) {
               await client.query('ROLLBACK').catch(() => {});
@@ -806,6 +874,15 @@ export function createApp({
         }
 
         await client.query('COMMIT');
+        await publishNotification('ReservationCancelled', notificationPayload({
+          reservationNo: req.params.no,
+          guestId: reservation.guest_id,
+          roomTypeId: reservation.room_type_id,
+          checkIn: reservation.check_in,
+          checkOut: reservation.check_out,
+          totalAmount: reservation.total_amount,
+          currency: reservation.currency,
+        }, { event: 'ReservationCancelled' }));
       } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
         throw error;

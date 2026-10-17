@@ -1,5 +1,5 @@
 import { app } from './app.js';
-import { startConsumer } from './consumer.js';
+import { QUEUE_NAMES, startConsumer } from './consumer.js';
 import { sendEmail, sendSms } from './mailer.js';
 
 const amqp = await import('amqplib');
@@ -9,6 +9,9 @@ const connection = await amqp.connect(
 const channel = await connection.createChannel();
 
 await startConsumer(channel, { sendEmail, sendSms });
+for (const queueName of QUEUE_NAMES.slice(1)) {
+  await startConsumer(channel, { sendEmail, sendSms }, queueName);
+}
 
 const port = process.env.PORT || 3000;
 const server = app.listen(port, () => {

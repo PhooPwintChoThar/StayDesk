@@ -1,4 +1,5 @@
 import { readFile } from 'node:fs/promises';
+import nock from 'nock';
 import request from 'supertest';
 import { app } from '../app.js';
 import { pool } from '../db.js';
@@ -16,11 +17,13 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
-  await pool.query('TRUNCATE payments CASCADE');
+  await pool.query('TRUNCATE payment_proofs, payments CASCADE');
   delete process.env.PAYMENT_MODE;
+  delete process.env.RESERVATION_SERVICE_URL;
 });
 
 afterAll(async () => {
+  nock.restore();
   await pool.end();
 });
 
@@ -78,5 +81,79 @@ describe('billing endpoints', () => {
       status: 'refunded',
       deposit_id: deposit.body.depositId
     });
+  });
+
+  it('stores, lists, streams, and reviews payment proofs', async () => {
+    process.env.RESERVATION_SERVICE_URL = 'http://reservation.test';
+    nock('http://reservation.test')
+      .get('/reservations/R-10001')
+      .reply(200, { reservationNo: 'R-10001', guestId: 'guest-123' });
+
+    const created = await request(app)
+      .post('/payments/proofs')
+      .set('x-user-id', 'guest-123')
+      .set('x-user-role', 'guest')
+      .field('reservationNo', 'R-10001')
+      .field('amount', '42.50')
+      .field('currency', 'USD')
+      .attach('file', Buffer.from('proof-bytes'), 'proof.pdf');
+
+    expect(created.status).toBe(201);
+    expect(created.body).toMatchObject({ status: 'pending' });
+
+    const list = await request(app)
+      .get('/payments/proofs')
+      .set('x-user-id', 'guest-123')
+      .set('x-user-role', 'guest')
+      .query({ reservationNo: 'R-10001' });
+
+    expect(list.status).toBe(200);
+    expect(list.body.proofs).toHaveLength(1);
+    expect(list.body.proofs[0]).not.toHaveProperty('file_data');
+
+    const file = await request(app)
+      .get(`/payments/proofs/${created.body.id}/file`)
+      .set('x-user-id', 'guest-123')
+      .set('x-user-role', 'guest');
+
+    expect(file.status).toBe(200);
+    expect(file.headers['content-type']).toContain('application/pdf');
+
+    const review = await request(app)
+      .put(`/payments/proofs/${created.body.id}/review`)
+      .set('x-user-id', 'agent-1')
+      .set('x-user-role', 'agent')
+      .send({ decision: 'approved' });
+
+    expect(review.status).toBe(200);
+    expect(review.body.proof).toMatchObject({ status: 'approved', reviewedBy: 'agent-1' });
+  });
+
+  it('rejects unsupported proof types and oversized uploads', async () => {
+    process.env.RESERVATION_SERVICE_URL = 'http://reservation.test';
+    nock('http://reservation.test')
+      .get('/reservations/R-10001')
+      .reply(200, { reservationNo: 'R-10001', guestId: 'guest-123' });
+
+    const badType = await request(app)
+      .post('/payments/proofs')
+      .set('x-user-id', 'guest-123')
+      .set('x-user-role', 'guest')
+      .field('reservationNo', 'R-10001')
+      .field('amount', '42.50')
+      .field('currency', 'USD')
+      .attach('file', Buffer.from('plain text'), 'proof.txt');
+
+    const large = await request(app)
+      .post('/payments/proofs')
+      .set('x-user-id', 'guest-123')
+      .set('x-user-role', 'guest')
+      .field('reservationNo', 'R-10001')
+      .field('amount', '42.50')
+      .field('currency', 'USD')
+      .attach('file', Buffer.alloc(5 * 1024 * 1024 + 1), 'proof.pdf');
+
+    expect(badType.status).toBe(400);
+    expect(large.status).toBe(413);
   });
 });
