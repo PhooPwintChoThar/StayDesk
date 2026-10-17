@@ -1,15 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { apiBlob, apiRequest } from "./api.js";
+import { showToast } from "./toast.js";
 
 export const MAX_PROOF_BYTES = 5 * 1024 * 1024;
 const ALLOWED_TYPES = ["image/png", "image/jpeg", "application/pdf"];
 const ALLOWED_EXTENSIONS = [".png", ".jpg", ".jpeg", ".pdf"];
-const REVOKE_DELAY_MS = 60_000;
 
 const STATUS_FILTERS = [
   { value: "pending", label: "Pending" },
   { value: "approved", label: "Approved" },
   { value: "rejected", label: "Rejected" },
+  { value: "refund_due", label: "Refund due" },
+  { value: "refunded", label: "Refunded" },
+  { value: "cancelled", label: "Cancelled" },
   { value: "all", label: "All" },
 ];
 
@@ -46,9 +49,10 @@ function normalizeSummary(summary) {
   return {
     total: pick(summary, ["totalAmount", "total"]),
     deposit: pick(summary, ["depositHeld", "depositAmount"]),
-    approved: pick(summary, ["approvedPayments", "approvedTotal", "approvedAmount"]),
+    approved: pick(summary, ["approvedProofsTotal", "approvedPayments", "approvedTotal", "approvedAmount"]),
     balance: pick(summary, ["balanceDue", "balance"]),
     currency: summary.currency,
+    status: summary.status,
   };
 }
 
@@ -71,8 +75,110 @@ function formatDate(value) {
 
 const day = (value) => String(value ?? "").slice(0, 10);
 
+const ROLE_LABELS = { agent: "Front desk", manager: "Manager" };
+
+export function reviewerLabel(proof) {
+  if (!proof.reviewedBy) return "—";
+  const role = ROLE_LABELS[proof.reviewedByRole];
+  return role ? `${proof.reviewedBy} (${role})` : proof.reviewedBy;
+}
+
+export const proofStatusLabel = (status) => String(status).replace("_", " ");
+
 function StatusBadge({ status }) {
-  return <span className={`status-pill ${status}`}>{status}</span>;
+  return <span className={`status-pill ${status}`}>{proofStatusLabel(status)}</span>;
+}
+
+// Shows a proof file inside the page. The file is fetched with the session token
+// and kept as an object URL only while the viewer is open.
+export function ProofViewer({ proof, onClose, showReviewer = true }) {
+  const [url, setUrl] = useState("");
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let objectUrl = "";
+    let cancelled = false;
+    apiBlob(`/payments/proofs/${encodeURIComponent(proof.id)}/file`)
+      .then((blob) => {
+        if (cancelled) return;
+        objectUrl = URL.createObjectURL(blob);
+        setUrl(objectUrl);
+      })
+      .catch((err) => {
+        if (!cancelled) setError(err.message);
+      });
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [proof.id]);
+
+  useEffect(() => {
+    const onKey = (event) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const isPdf = proof.fileType === "application/pdf";
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div
+        className="modal-card"
+        role="dialog"
+        aria-modal="true"
+        aria-label={`Payment proof ${proof.paymentNo || proof.fileName}`}
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="register-header">
+          <div>
+            <h3>{proof.paymentNo || "Payment proof"} · {proof.reservationNo}</h3>
+            <p className="muted">
+              {money(proof.amount, proof.currency)} · {proof.fileName} · <StatusBadge status={proof.status} />
+            </p>
+            <dl className="detail-grid proof-meta">
+              <dt>Booking</dt>
+              <dd>{proof.reservationNo}</dd>
+              <dt>Submitted</dt>
+              <dd>{formatDate(proof.createdAt) || "—"}</dd>
+              {showReviewer && (
+                <>
+                  <dt>{proof.status === "rejected" ? "Rejected by" : "Approved by"}</dt>
+                  <dd>{reviewerLabel(proof)}</dd>
+                </>
+              )}
+              <dt>{proof.status === "rejected" ? "Rejected on" : proof.status === "approved" ? "Approved on" : "Reviewed on"}</dt>
+              <dd>{formatDate(proof.reviewedAt) || "—"}</dd>
+              {proof.reviewNote && (
+                <>
+                  <dt>Review note</dt>
+                  <dd>{proof.reviewNote}</dd>
+                </>
+              )}
+            </dl>
+          </div>
+          <div className="lookup-actions">
+            {url && (
+              <a className="page-btn" href={url} download={proof.fileName}>
+                Download
+              </a>
+            )}
+            <button type="button" className="page-btn" onClick={onClose}>
+              Close
+            </button>
+          </div>
+        </div>
+        {error && <p role="alert" className="error">{error}</p>}
+        {!url && !error && <p className="muted">Loading file…</p>}
+        {url && (isPdf ? (
+          <iframe className="proof-frame" title={proof.fileName} src={url} />
+        ) : (
+          <img className="proof-image" src={url} alt={`Payment proof ${proof.fileName}`} />
+        ))}
+      </div>
+    </div>
+  );
 }
 
 function useMounted() {
@@ -104,7 +210,7 @@ function GuestPayments({ session }) {
   const [fileKey, setFileKey] = useState(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [success, setSuccess] = useState("");
+  const [viewing, setViewing] = useState(null);
 
   // The gateway returns only this guest's reservations; the filter below is a
   // second, purely cosmetic guard.
@@ -180,7 +286,6 @@ function GuestPayments({ session }) {
       return;
     }
     setError("");
-    setSuccess("");
     resetForm();
     loadDetail(selectedNo).then((loaded) => {
       if (loaded && Number(loaded.balance) > 0) setAmount(amountText(loaded.balance));
@@ -189,7 +294,6 @@ function GuestPayments({ session }) {
 
   function handleFileChange(event) {
     const chosen = event.target.files?.[0] || null;
-    setSuccess("");
     if (!chosen) {
       setFile(null);
       setError("");
@@ -209,7 +313,6 @@ function GuestPayments({ session }) {
   async function handleSubmit(event) {
     event.preventDefault();
     if (busy || !selectedNo) return;
-    setSuccess("");
 
     const problem = validateProofFile(file) || validateAmount(amount);
     if (problem) {
@@ -236,7 +339,9 @@ function GuestPayments({ session }) {
       await apiRequest("/payments/proofs", { method: "POST", body: form });
       if (!mounted.current) return;
       resetForm();
-      setSuccess("Payment proof uploaded. Our staff will review it shortly.");
+      showToast("Our staff will review it shortly. You will get an email when it is approved.", {
+        title: "Payment proof uploaded",
+      });
       const loaded = await loadDetail(selectedNo);
       if (loaded && Number(loaded.balance) > 0) setAmount(amountText(loaded.balance));
     } catch (err) {
@@ -248,6 +353,9 @@ function GuestPayments({ session }) {
 
   const selected = reservations.find((item) => item.reservationNo === selectedNo);
   const currency = summary?.currency || selected?.currency || "";
+  const cancelled = (summary?.status || selected?.status) === "cancelled";
+  const settled = summary != null && Number(summary.balance) <= 0;
+  const uploadBlocked = cancelled || settled;
 
   return (
     <section className="register-panel" aria-labelledby="payments-heading">
@@ -262,11 +370,6 @@ function GuestPayments({ session }) {
         <p role="alert" className="error">
           {error}
         </p>
-      )}
-      {success && (
-        <div role="status" className="confirmation-card">
-          <p>{success}</p>
-        </div>
       )}
 
       {listState === "loading" && <p className="muted">Loading your reservations…</p>}
@@ -320,6 +423,13 @@ function GuestPayments({ session }) {
           )}
 
           <h3>Upload payment proof</h3>
+          {uploadBlocked && (
+            <p className="muted">
+              {cancelled
+                ? "This reservation is cancelled, so no payment is needed."
+                : "Nothing is due on this reservation."}
+            </p>
+          )}
           <form className="form-grid" onSubmit={handleSubmit} noValidate>
             <label>
               Proof file (PNG, JPEG or PDF, max 5 MB)
@@ -338,10 +448,7 @@ function GuestPayments({ session }) {
                 min="0.01"
                 step="0.01"
                 value={amount}
-                onChange={(event) => {
-                  setAmount(event.target.value);
-                  setSuccess("");
-                }}
+                onChange={(event) => setAmount(event.target.value)}
               />
             </label>
             <label>
@@ -355,7 +462,7 @@ function GuestPayments({ session }) {
             <button
               type="submit"
               className="primary-action"
-              disabled={busy || !selectedNo || detailState === "loading"}
+              disabled={busy || !selectedNo || detailState === "loading" || uploadBlocked}
             >
               {busy ? "Uploading…" : "Upload proof"}
             </button>
@@ -370,7 +477,7 @@ function GuestPayments({ session }) {
               {proofs.map((proof) => (
                 <li key={proof.id}>
                   <div>
-                    <strong>{proof.fileName}</strong>
+                    <strong>{proof.paymentNo ? `${proof.paymentNo} · ` : ""}{proof.fileName}</strong>
                     <div className="muted">
                       {money(proof.amount, proof.currency)}
                       {proof.createdAt ? ` · ${formatDate(proof.createdAt)}` : ""}
@@ -381,14 +488,31 @@ function GuestPayments({ session }) {
                         Reviewer note: {proof.reviewNote || "No reason was given."}
                       </div>
                     )}
+                    {proof.status === "cancelled" && (
+                      <div className="muted">Cancelled together with the booking.</div>
+                    )}
+                    {proof.status === "refund_due" && (
+                      <div className="proof-review-note">
+                        The booking was cancelled. The hotel will refund this payment.
+                      </div>
+                    )}
+                    {proof.status === "refunded" && (
+                      <div className="muted">Refunded{proof.refundedAt ? ` on ${formatDate(proof.refundedAt)}` : ""}.</div>
+                    )}
                   </div>
-                  <StatusBadge status={proof.status} />
+                  <div className="lookup-actions">
+                    <StatusBadge status={proof.status} />
+                    <button type="button" className="page-btn" onClick={() => setViewing(proof)}>
+                      View
+                    </button>
+                  </div>
                 </li>
               ))}
             </ul>
           )}
         </>
       )}
+      {viewing && <ProofViewer proof={viewing} showReviewer={false} onClose={() => setViewing(null)} />}
     </section>
   );
 }
@@ -397,7 +521,6 @@ function GuestPayments({ session }) {
 function StaffPayments() {
   const mounted = useMounted();
   const loadSeq = useRef(0);
-  const pendingUrls = useRef(new Set());
 
   const [statusFilter, setStatusFilter] = useState("pending");
   const [numberInput, setNumberInput] = useState("");
@@ -405,26 +528,17 @@ function StaffPayments() {
   const [proofs, setProofs] = useState([]);
   const [state, setState] = useState("loading");
   const [error, setError] = useState("");
-  const [success, setSuccess] = useState("");
   const [rejectingId, setRejectingId] = useState(null);
   const [rejectNote, setRejectNote] = useState("");
   const [reviewingId, setReviewingId] = useState(null);
-  const [openingId, setOpeningId] = useState(null);
-
-  useEffect(
-    () => () => {
-      for (const url of pendingUrls.current) URL.revokeObjectURL(url);
-      pendingUrls.current.clear();
-    },
-    [],
-  );
+  const [viewing, setViewing] = useState(null);
 
   const loadQueue = useCallback(async () => {
     const seq = ++loadSeq.current;
     setState("loading");
     const params = new URLSearchParams();
     if (statusFilter !== "all") params.set("status", statusFilter);
-    if (appliedNumber) params.set("reservationNo", appliedNumber);
+    if (appliedNumber) params.set("q", appliedNumber);
     const query = params.toString();
     try {
       const result = await apiRequest(`/payments/proofs${query ? `?${query}` : ""}`);
@@ -446,28 +560,20 @@ function StaffPayments() {
     loadQueue();
   }, [loadQueue]);
 
-  async function viewFile(proof) {
-    if (openingId) return;
-    setOpeningId(proof.id);
+  async function markRefunded(proof) {
+    if (reviewingId) return;
+    if (!window.confirm(`Confirm that ${money(proof.amount, proof.currency)} (${proof.paymentNo}) was refunded to the guest?`)) return;
+    setReviewingId(proof.id);
     setError("");
-    // Open the tab synchronously (inside the click) so popup blockers allow it.
-    const tab = window.open("", "_blank");
-    if (tab) tab.opener = null;
     try {
-      const blob = await apiBlob(`/payments/proofs/${encodeURIComponent(proof.id)}/file`);
-      const url = URL.createObjectURL(blob);
-      pendingUrls.current.add(url);
-      if (tab) tab.location.href = url;
-      else window.open(url, "_blank", "noopener,noreferrer");
-      setTimeout(() => {
-        URL.revokeObjectURL(url);
-        pendingUrls.current.delete(url);
-      }, REVOKE_DELAY_MS);
+      await apiRequest(`/payments/proofs/${encodeURIComponent(proof.id)}/refund`, { method: "PUT" });
+      if (!mounted.current) return;
+      showToast(`${money(proof.amount, proof.currency)} recorded as refunded.`, { title: proof.paymentNo || "Refund" });
+      await loadQueue();
     } catch (err) {
-      if (tab) tab.close();
       if (mounted.current) setError(err.message);
     } finally {
-      if (mounted.current) setOpeningId(null);
+      if (mounted.current) setReviewingId(null);
     }
   }
 
@@ -475,17 +581,23 @@ function StaffPayments() {
     if (reviewingId) return;
     setReviewingId(proof.id);
     setError("");
-    setSuccess("");
     try {
       const body = decision === "rejected" ? { decision, note: note.trim() } : { decision };
-      await apiRequest(`/payments/proofs/${encodeURIComponent(proof.id)}/review`, {
+      const result = await apiRequest(`/payments/proofs/${encodeURIComponent(proof.id)}/review`, {
         method: "PUT",
         body: JSON.stringify(body),
       });
       if (!mounted.current) return;
       setRejectingId(null);
       setRejectNote("");
-      setSuccess(decision === "approved" ? "Payment proof approved." : "Payment proof rejected.");
+      showToast(
+        decision === "rejected"
+          ? "Payment proof rejected."
+          : result?.bookingConfirmed
+            ? `Payment proof approved. Booking ${proof.reservationNo} is now confirmed and the guest has been emailed.`
+            : "Payment proof approved.",
+        { title: proof.paymentNo || "Payment review" },
+      );
       await loadQueue();
     } catch (err) {
       if (mounted.current) setError(err.message);
@@ -496,7 +608,6 @@ function StaffPayments() {
 
   function applyFilter(event) {
     event.preventDefault();
-    setSuccess("");
     setAppliedNumber(numberInput.trim());
   }
 
@@ -517,7 +628,6 @@ function StaffPayments() {
             value={statusFilter}
             onChange={(event) => {
               setStatusFilter(event.target.value);
-              setSuccess("");
             }}
           >
             {STATUS_FILTERS.map((item) => (
@@ -528,10 +638,10 @@ function StaffPayments() {
           </select>
         </div>
         <div className="field">
-          <label htmlFor="proof-number-filter">Confirmation number</label>
+          <label htmlFor="proof-number-filter">Booking or payment number</label>
           <input
             id="proof-number-filter"
-            placeholder="R-…"
+            placeholder="R-… or PMT-…"
             value={numberInput}
             onChange={(event) => setNumberInput(event.target.value)}
           />
@@ -548,11 +658,6 @@ function StaffPayments() {
           {error}
         </p>
       )}
-      {success && (
-        <div role="status" className="confirmation-card">
-          <p>{success}</p>
-        </div>
-      )}
 
       {state === "loading" && <p className="muted">Loading payment proofs…</p>}
       {state === "ready" && proofs.length === 0 && (
@@ -564,9 +669,8 @@ function StaffPayments() {
           <table aria-label="Payment proofs">
             <thead>
               <tr>
-                <th>RESERVATION</th>
+                <th>PAYMENT</th>
                 <th>AMOUNT</th>
-                <th>FILE</th>
                 <th>SUBMITTED</th>
                 <th>STATUS</th>
                 <th>ACTIONS</th>
@@ -588,17 +692,18 @@ function StaffPayments() {
                     setRejectingId(null);
                     setRejectNote("");
                   }}
-                  onView={() => viewFile(proof)}
+                  onView={() => setViewing(proof)}
                   onApprove={() => review(proof, "approved")}
+                  onMarkRefunded={() => markRefunded(proof)}
                   onReject={() => review(proof, "rejected", rejectNote)}
                   busy={reviewingId === proof.id}
-                  opening={openingId === proof.id}
                 />
               ))}
             </tbody>
           </table>
         </div>
       )}
+      {viewing && <ProofViewer proof={viewing} onClose={() => setViewing(null)} />}
     </section>
   );
 }
@@ -613,28 +718,45 @@ function ProofRows({
   onView,
   onApprove,
   onReject,
+  onMarkRefunded,
   busy,
-  opening,
 }) {
   const noteId = `reject-note-${proof.id}`;
   return (
     <>
       <tr>
-        <td>{proof.reservationNo}</td>
-        <td>{money(proof.amount, proof.currency)}</td>
-        <td title={proof.note || undefined}>{proof.fileName}</td>
-        <td>{formatDate(proof.createdAt)}</td>
+        <td className="wrap-cell payment-cell">
+          <button type="button" className="link-button" onClick={onView} aria-label={`Open ${proof.paymentNo || "payment"}`}>
+            {proof.paymentNo || "—"}
+          </button>
+          <div className="muted booking-ref">{proof.reservationNo}</div>
+        </td>
+        <td className="nowrap">{money(proof.amount, proof.currency)}</td>
         <td>
+          {formatDate(proof.createdAt)}
+          <div className="muted" title={proof.note || undefined}>{proof.fileName}</div>
+        </td>
+        <td className="wrap-cell">
           <StatusBadge status={proof.status} />
+          {proof.reviewedBy && (
+            <div className="muted">
+              by {reviewerLabel(proof)} · {formatDate(proof.reviewedAt)}
+            </div>
+          )}
           {proof.status === "rejected" && proof.reviewNote && (
             <div className="muted">{proof.reviewNote}</div>
           )}
         </td>
         <td>
-          <div className="lookup-actions">
-            <button type="button" className="page-btn" onClick={onView} disabled={opening}>
+          <div className="lookup-actions proof-actions">
+            <button type="button" className="page-btn" onClick={onView}>
               View file
             </button>
+            {proof.status === "refund_due" && (
+              <button type="button" className="page-btn" onClick={onMarkRefunded} disabled={busy}>
+                Mark refunded
+              </button>
+            )}
             {proof.status === "pending" && (
               <>
                 <button type="button" className="page-btn" onClick={onApprove} disabled={busy}>
@@ -655,7 +777,7 @@ function ProofRows({
       </tr>
       {rejecting && (
         <tr className="reject-row">
-          <td colSpan="6">
+          <td colSpan="5">
             <form
               className="form-grid"
               onSubmit={(event) => {

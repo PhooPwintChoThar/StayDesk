@@ -1,8 +1,8 @@
 import pg from 'pg';
 
-const { Pool } = pg;
+const database = process.env.NODE_ENV === 'test' ? 'room_rate_test' : 'room_rate_db';
 
-export const pool = new Pool({
+export const pool = new pg.Pool({
   connectionString: process.env.DATABASE_URL
-        || 'postgres://postgres:postgres@localhost:55432/room_rate_db'
+    || `postgres://postgres:postgres@localhost:55432/${database}`
 });

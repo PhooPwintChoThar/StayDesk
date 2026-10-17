@@ -19,12 +19,15 @@ beforeEach(() => {
 });
 
 describe("sidebar per role", () => {
-  it.each(["agent", "manager"])("shows Reservations, Guests and Payments for %s", async (role) => {
+  it.each([
+    ["agent", ["Reservations", "Guests", "Payments"]],
+    ["manager", ["Reservations", "Guests", "Payments", "Room management"]],
+  ])("shows the right menu items for %s", async (role, expected) => {
     setRole(role);
     render(<App />);
     await screen.findByRole("button", { name: /Guests$/ });
 
-    expect(navNames()).toEqual(["Reservations", "Guests", "Payments"]);
+    expect(navNames()).toEqual(expected);
     expect(screen.queryByRole("button", { name: "My profile" })).not.toBeInTheDocument();
     for (const name of REMOVED) {
       expect(screen.queryByRole("button", { name })).not.toBeInTheDocument();
@@ -40,7 +43,7 @@ describe("sidebar per role", () => {
     expect(navNames()).toEqual(["Reservations", "Payments", "My profile"]);
     expect(screen.queryByRole("button", { name: /Guests$/ })).not.toBeInTheDocument();
     expect(screen.getByText("Book a room / My bookings")).toBeInTheDocument();
-    expect(screen.queryByText("Find a guest")).not.toBeInTheDocument();
+    expect(screen.queryByText("Every guest profile, with their bookings")).not.toBeInTheDocument();
   });
 });
 
@@ -62,11 +65,11 @@ describe("view guard", () => {
     setRole("agent");
     render(<App />);
     await userEvent.click(await screen.findByRole("button", { name: /Guests$/ }));
-    expect(await screen.findByText("Find a guest")).toBeInTheDocument();
+    expect(await screen.findByText("Every guest profile, with their bookings")).toBeInTheDocument();
 
     await userEvent.selectOptions(screen.getByLabelText("Signed in as"), "guest");
 
-    await waitFor(() => expect(screen.queryByText("Find a guest")).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.queryByText("Every guest profile, with their bookings")).not.toBeInTheDocument());
     expect(screen.queryByRole("button", { name: /Guests$/ })).not.toBeInTheDocument();
     expect(await screen.findByText("Book a room / My bookings")).toBeInTheDocument();
   });

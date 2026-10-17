@@ -3,13 +3,24 @@
 
 const ROLES = ["guest", "agent", "manager"];
 
+// Holds, deposits and refunds are driven by the reservation saga only; exposing
+// them would let callers block rooms or move money outside the reservation ledger.
+export function isInternalOnly(path) {
+  return /^\/(holds|deposits|refunds|settlements)(\/|$)/.test(path) ||
+    path.startsWith("/payments/reservations/") ||
+    /^\/reservations\/[^/]+\/payment-approved$/.test(path);
+}
+
+const MANAGER_WRITE_ROUTES = /^\/(rooms|room-types)(\/.*)?$/;
+
 export function serviceForPath(path) {
+  if (isInternalOnly(path)) return null;
   if (
     path === "/availability" ||
-    path === "/hotels" ||
     path === "/room-types" ||
-    path === "/holds" ||
-    path.startsWith("/holds/")
+    path === "/rooms" ||
+    path.startsWith("/room-types/") ||
+    path.startsWith("/rooms/")
   ) {
     return ["ROOM_RATE_SERVICE_URL", "http://room-rate:3000"];
   }
@@ -17,9 +28,6 @@ export function serviceForPath(path) {
     return ["GUEST_SERVICE_URL", "http://guest:3000"];
   }
   if (path.startsWith("/guests")) return ["GUEST_SERVICE_URL", "http://guest:3000"];
-  if (path === "/deposits" || path === "/refunds") {
-    return ["BILLING_SERVICE_URL", "http://billing:3000"];
-  }
   if (path === "/payments" || path.startsWith("/payments/")) {
     return ["BILLING_SERVICE_URL", "http://billing:3000"];
   }
@@ -29,18 +37,20 @@ export function serviceForPath(path) {
   return null;
 }
 
+const ROOM_PHOTO = /^\/room-types\/[^/]+\/photos\/[^/]+$/;
+
 export function isPublicRoute(method, path) {
   return (
     method === "GET" &&
-    (path === "/availability" || path === "/hotels" || path === "/room-types")
+    (path === "/availability" || path === "/room-types" || ROOM_PHOTO.test(path))
   ) || (method === "POST" && path === "/auth/register");
 }
 
 export function allowedForGuest(method, path) {
   return (
     (method === "GET" && path === "/availability") ||
-    (method === "GET" && path === "/hotels") ||
     (method === "GET" && path === "/room-types") ||
+    (method === "GET" && ROOM_PHOTO.test(path)) ||
     (method === "GET" && path === "/reservations") ||
     (method === "POST" && path === "/reservations") ||
     (["GET", "PUT", "DELETE"].includes(method) &&
@@ -127,6 +137,13 @@ export class AuthorizeHandler extends Handler {
       return res.status(403).json({ error: "Forbidden" });
     }
     if (
+      MANAGER_WRITE_ROUTES.test(req.path) &&
+      ["POST", "PATCH", "PUT", "DELETE"].includes(req.method) &&
+      role !== "manager"
+    ) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+    if (
       req.method === "DELETE" &&
       /^\/guests\/[^/]+$/.test(req.path) &&
       role !== "manager"
@@ -149,7 +166,7 @@ export class RouteHandler extends Handler {
     const { req, res, service } = ctx;
     const [envName, fallback] = service;
     const baseUrl = (process.env[envName] || fallback).replace(/\/$/, "");
-    const isProofUpload = req.method === "POST" && req.path === "/payments/proofs" && req.headers["content-type"]?.includes("multipart/form-data");
+    const isMultipart = req.headers["content-type"]?.includes("multipart/form-data");
     const target = new URL(req.originalUrl, "http://gateway.local");
 
     if (ctx.role === "guest" && req.method === "POST" && req.path === "/reservations") {
@@ -186,10 +203,10 @@ export class RouteHandler extends Handler {
       const response = await this.http.request({
         method: req.method,
         url: `${baseUrl}${target.pathname}${target.search}`,
-        data: isProofUpload ? req : req.body,
+        data: isMultipart ? req : req.body,
         headers: {
           "content-type": req.headers["content-type"] || "application/json",
-          ...(isProofUpload && req.headers["content-length"] ? { "content-length": req.headers["content-length"] } : {}),
+          ...(isMultipart && req.headers["content-length"] ? { "content-length": req.headers["content-length"] } : {}),
           ...(userIdForClaims(ctx) ? { "x-user-id": userIdForClaims(ctx) } : {}),
           ...(ctx.role ? { "x-user-role": ctx.role } : {}),
           ...(process.env.INTERNAL_TOKEN ? { "x-internal-token": process.env.INTERNAL_TOKEN } : {}),
@@ -199,10 +216,17 @@ export class RouteHandler extends Handler {
         },
         maxBodyLength: Infinity,
         maxContentLength: Infinity,
+        // Raw bytes: files and photos must pass through unchanged.
+        responseType: "arraybuffer",
         validateStatus: () => true,
       });
 
-      return res.status(response.status).send(response.data);
+      for (const header of ["content-type", "content-disposition", "cache-control"]) {
+        if (response.headers?.[header]) res.setHeader(header, response.headers[header]);
+      }
+      res.status(response.status);
+      if (response.status === 204 || response.status === 304) return res.end();
+      return res.send(Buffer.from(response.data ?? ""));
     } catch {
       return res.status(502).json({ error: "BadGateway" });
     }

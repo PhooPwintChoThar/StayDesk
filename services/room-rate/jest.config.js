@@ -1,4 +1,5 @@
 export default {
   testEnvironment: 'node',
-  transform: {}
+  transform: {},
+  globalSetup: './tests/global-setup.js'
 };

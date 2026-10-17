@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import PaymentsScreen from "./PaymentsScreen.jsx";
 import { setRole } from "./api.js";
-import { GUEST_ID, calls, headerOf, mockApi, reply } from "./test-helpers.js";
+import { GUEST_ID, calls, headerOf, mockApi, reply, renderWithToaster, stubConfirm } from "./test-helpers.js";
 
 // The file input restricts choices through `accept`; a user can still pick any
 // file ("All files"), so the tests bypass that filter to exercise our checks.
@@ -58,7 +58,7 @@ describe("guest payments", () => {
 
   it("lists only the guest's own reservations and loads summary and proofs", async () => {
     mockApi(guestRoutes());
-    render(<PaymentsScreen session={guestSession} />);
+    renderWithToaster(<PaymentsScreen session={guestSession} />);
 
     const select = await screen.findByLabelText("Reservation");
     const options = within(select).getAllByRole("option").map((o) => o.value);
@@ -77,7 +77,7 @@ describe("guest payments", () => {
 
   it("loads the other reservation when the guest switches", async () => {
     mockApi(guestRoutes());
-    render(<PaymentsScreen session={guestSession} />);
+    renderWithToaster(<PaymentsScreen session={guestSession} />);
     await screen.findByLabelText("Payment summary");
 
     await userEvent.selectOptions(screen.getByLabelText("Reservation"), "R-OWN-2");
@@ -103,7 +103,7 @@ describe("guest payments", () => {
           }),
       }),
     );
-    render(<PaymentsScreen session={guestSession} />);
+    renderWithToaster(<PaymentsScreen session={guestSession} />);
 
     const list = await screen.findByRole("list", { name: "Payment proofs" });
     const items = within(list).getAllByRole("listitem");
@@ -118,7 +118,7 @@ describe("guest payments", () => {
 
   it("shows an empty state when the guest has no reservations", async () => {
     mockApi({ "GET /reservations": () => reply(200, { reservations: [] }) });
-    render(<PaymentsScreen session={guestSession} />);
+    renderWithToaster(<PaymentsScreen session={guestSession} />);
 
     expect(await screen.findByText(/You have no reservations yet/)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Upload proof" })).not.toBeInTheDocument();
@@ -126,7 +126,7 @@ describe("guest payments", () => {
 
   it("shows an error state when reservations cannot be loaded", async () => {
     mockApi({ "GET /reservations": () => reply(500, { error: "Boom", message: "Server is down" }) });
-    render(<PaymentsScreen session={guestSession} />);
+    renderWithToaster(<PaymentsScreen session={guestSession} />);
 
     expect(await screen.findByRole("alert")).toHaveTextContent("Server is down");
   });
@@ -134,7 +134,7 @@ describe("guest payments", () => {
   describe("upload validation", () => {
     async function setup() {
       mockApi(guestRoutes({ "POST /payments/proofs": () => reply(201, { id: "new", status: "pending" }) }));
-      render(<PaymentsScreen session={guestSession} />);
+      renderWithToaster(<PaymentsScreen session={guestSession} />);
       await screen.findByLabelText("Payment summary");
       await waitFor(() => expect(screen.getByLabelText(/^Amount/)).toHaveValue(150));
     }
@@ -191,7 +191,7 @@ describe("guest payments", () => {
         },
       }),
     );
-    render(<PaymentsScreen session={guestSession} />);
+    renderWithToaster(<PaymentsScreen session={guestSession} />);
     await screen.findByLabelText("Payment summary");
     await waitFor(() => expect(screen.getByLabelText(/^Amount/)).toHaveValue(150));
 
@@ -224,7 +224,7 @@ describe("guest payments", () => {
 
   it("shows the server error when an upload fails", async () => {
     mockApi(guestRoutes({ "POST /payments/proofs": () => reply(413, { message: "The uploaded file must be 5 MB or smaller." }) }));
-    render(<PaymentsScreen session={guestSession} />);
+    renderWithToaster(<PaymentsScreen session={guestSession} />);
     await screen.findByLabelText("Payment summary");
     await waitFor(() => expect(screen.getByLabelText(/^Amount/)).toHaveValue(150));
 
@@ -251,7 +251,7 @@ describe("staff payments", () => {
 
   it("loads the pending queue by default and renders no guest controls", async () => {
     mockApi(staffRoutes());
-    render(<PaymentsScreen session={agentSession} />);
+    renderWithToaster(<PaymentsScreen session={agentSession} />);
 
     const table = await screen.findByRole("table", { name: "Payment proofs" });
     expect(within(table).getByText("R-100")).toBeInTheDocument();
@@ -263,7 +263,7 @@ describe("staff payments", () => {
 
   it("filters by status and confirmation number", async () => {
     mockApi(staffRoutes());
-    render(<PaymentsScreen session={agentSession} />);
+    renderWithToaster(<PaymentsScreen session={agentSession} />);
     await screen.findByRole("table", { name: "Payment proofs" });
 
     await userEvent.selectOptions(screen.getByLabelText("Proof status"), "rejected");
@@ -272,23 +272,21 @@ describe("staff payments", () => {
     await userEvent.selectOptions(screen.getByLabelText("Proof status"), "all");
     await waitFor(() => expect(calls("GET", "/payments/proofs").some(([u]) => u.endsWith("/payments/proofs"))).toBe(true));
 
-    await userEvent.type(screen.getByLabelText("Confirmation number"), " R-200 ");
+    await userEvent.type(screen.getByLabelText("Booking or payment number"), " PMT-000002 ");
     await userEvent.click(screen.getByRole("button", { name: "Apply filter" }));
     await waitFor(() =>
-      expect(calls("GET", "/payments/proofs?reservationNo=R-200")).toHaveLength(1),
+      expect(calls("GET", "/payments/proofs?q=PMT-000002")).toHaveLength(1),
     );
   });
 
   it("shows an empty state", async () => {
     mockApi({ "GET /payments/proofs": () => reply(200, { proofs: [] }) });
-    render(<PaymentsScreen session={agentSession} />);
+    renderWithToaster(<PaymentsScreen session={agentSession} />);
 
     expect(await screen.findByText("No payment proofs match this filter.")).toBeInTheDocument();
   });
 
-  it("opens a file through an authenticated blob in a new tab and revokes the URL", async () => {
-    const tab = { location: { href: "" }, close: vi.fn(), opener: {} };
-    vi.spyOn(window, "open").mockReturnValue(tab);
+  it("shows the proof file inside the page every time it is opened, and frees it on close", async () => {
     URL.createObjectURL = vi.fn(() => "blob:proof-1");
     URL.revokeObjectURL = vi.fn();
     mockApi(
@@ -297,20 +295,35 @@ describe("staff payments", () => {
           reply(200, null, { blob: async () => new Blob(["x"], { type: "image/png" }) }),
       }),
     );
-    const { unmount } = render(<PaymentsScreen session={agentSession} />);
+    renderWithToaster(<PaymentsScreen session={agentSession} />);
     const row = (await screen.findByText("R-100")).closest("tr");
 
-    await userEvent.click(within(row).getByRole("button", { name: "View file" }));
+    for (let view = 1; view <= 2; view += 1) {
+      await userEvent.click(within(row).getByRole("button", { name: "View file" }));
+      const dialog = await screen.findByRole("dialog");
+      expect(await within(dialog).findByRole("img")).toHaveAttribute("src", "blob:proof-1");
+      await userEvent.click(within(dialog).getByRole("button", { name: "Close" }));
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+      expect(URL.revokeObjectURL).toHaveBeenCalledTimes(view);
+    }
 
-    await waitFor(() => expect(tab.location.href).toBe("blob:proof-1"));
     const [url, options] = calls("GET", "/payments/proofs/p1/file")[0];
     expect(url).not.toMatch(/token|Bearer/i);
     expect(headerOf(options.headers, "Authorization")).toMatch(/^Bearer /);
-    expect(window.open).toHaveBeenCalledWith("", "_blank");
-    expect(tab.opener).toBeNull();
+  });
 
-    unmount(); // pending object URLs are revoked on unmount
-    expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:proof-1");
+  it("lets a guest view their own uploaded proof", async () => {
+    setRole("guest");
+    URL.createObjectURL = vi.fn(() => "blob:mine");
+    URL.revokeObjectURL = vi.fn();
+    mockApi(guestRoutes({
+      "GET /payments/proofs/p1/file": () => reply(200, null, { blob: async () => new Blob(["x"], { type: "image/png" }) }),
+    }));
+    renderWithToaster(<PaymentsScreen session={guestSession} />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "View" }));
+
+    expect(await within(await screen.findByRole("dialog")).findByRole("img")).toHaveAttribute("src", "blob:mine");
   });
 
   it("approves a proof and reloads the queue", async () => {
@@ -324,7 +337,7 @@ describe("staff payments", () => {
         },
       }),
     );
-    render(<PaymentsScreen session={agentSession} />);
+    renderWithToaster(<PaymentsScreen session={agentSession} />);
     const row = (await screen.findByText("R-100")).closest("tr");
 
     await userEvent.click(within(row).getByRole("button", { name: "Approve" }));
@@ -340,7 +353,7 @@ describe("staff payments", () => {
         "PUT /payments/proofs/p2/review": () => reply(200, { proof: { ...queue[1], status: "rejected" } }),
       }),
     );
-    render(<PaymentsScreen session={agentSession} />);
+    renderWithToaster(<PaymentsScreen session={agentSession} />);
     const row = (await screen.findByText("R-200")).closest("tr");
 
     await userEvent.click(within(row).getByRole("button", { name: "Reject" }));
@@ -364,7 +377,7 @@ describe("staff payments", () => {
 
   it("shows a friendly message on 403", async () => {
     mockApi({ "GET /payments/proofs": () => reply(403, { error: "Forbidden", message: "raw" }) });
-    render(<PaymentsScreen session={agentSession} />);
+    renderWithToaster(<PaymentsScreen session={agentSession} />);
 
     expect(await screen.findByRole("alert")).toHaveTextContent("You do not have permission to do that.");
   });
@@ -374,20 +387,83 @@ describe("per-role rendering", () => {
   it("renders the guest screen for guests and the review queue for managers", async () => {
     setRole("guest");
     mockApi(guestRoutes());
-    const guest = render(<PaymentsScreen session={guestSession} />);
+    const guest = renderWithToaster(<PaymentsScreen session={guestSession} />);
     expect(await screen.findByRole("heading", { name: "My payments" })).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Payment proof review" })).not.toBeInTheDocument();
     guest.unmount();
 
     setRole("manager");
     mockApi({ "GET /payments/proofs": () => reply(200, { proofs: [] }) });
-    render(<PaymentsScreen session={{ token: "t", claims: { role: "manager", sub: "manager" } }} />);
+    renderWithToaster(<PaymentsScreen session={{ token: "t", claims: { role: "manager", sub: "manager" } }} />);
     expect(await screen.findByRole("heading", { name: "Payment proof review" })).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "My payments" })).not.toBeInTheDocument();
   });
 
   it("renders neither for an unknown role", () => {
-    render(<PaymentsScreen session={{ token: "t", claims: { role: "intern" } }} />);
+    renderWithToaster(<PaymentsScreen session={{ token: "t", claims: { role: "intern" } }} />);
     expect(screen.getByText("Payments are not available for this account.")).toBeInTheDocument();
   });
 });
+
+describe("guest privacy", () => {
+  it("does not tell a guest who approved their payment", async () => {
+    setRole("guest");
+    URL.createObjectURL = vi.fn(() => "blob:mine");
+    URL.revokeObjectURL = vi.fn();
+    mockApi(guestRoutes({
+      "GET /payments/proofs?reservationNo=R-OWN-1": () =>
+        reply(200, { proofs: [proof({ status: "approved", reviewedBy: "reception", reviewedByRole: "agent", reviewedAt: "2027-03-02T10:00:00Z" })] }),
+      "GET /payments/proofs/p1/file": () => reply(200, null, { blob: async () => new Blob(["x"], { type: "image/png" }) }),
+    }));
+    renderWithToaster(<PaymentsScreen session={guestSession} />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "View" }));
+    const dialog = await screen.findByRole("dialog");
+
+    expect(within(dialog).getByText("Approved on")).toBeInTheDocument();
+    expect(within(dialog).queryByText("Approved by")).not.toBeInTheDocument();
+    expect(screen.queryByText(/reception/)).not.toBeInTheDocument();
+  });
+});
+
+describe("payments of cancelled bookings", () => {
+  beforeEach(() => setRole("agent"));
+
+  it("lets staff mark a refund-due payment as refunded", async () => {
+    stubConfirm(true);
+    let status = "refund_due";
+    mockApi({
+      "GET /payments/proofs": () =>
+        reply(200, { proofs: [proof({ id: "p9", paymentNo: "PMT-000009", reservationNo: "R-CXL", amount: 140, status })] }),
+      "PUT /payments/proofs/p9/refund": () => {
+        status = "refunded";
+        return reply(200, { proof: proof({ id: "p9", status }) });
+      },
+    });
+    renderWithToaster(<PaymentsScreen session={agentSession} />);
+
+    await userEvent.selectOptions(screen.getByLabelText("Proof status"), "refund_due");
+    const row = (await screen.findByText("R-CXL")).closest("tr");
+    expect(within(row).getByText("refund due")).toBeInTheDocument();
+    expect(within(row).queryByRole("button", { name: "Approve" })).not.toBeInTheDocument();
+
+    await userEvent.click(within(row).getByRole("button", { name: "Mark refunded" }));
+
+    await waitFor(() => expect(calls("PUT", "/payments/proofs/p9/refund")).toHaveLength(1));
+    expect(await screen.findByRole("status")).toHaveTextContent("140.00 USD recorded as refunded.");
+    expect(calls("GET", "/payments/proofs?status=refund_due").length).toBeGreaterThan(0);
+  });
+
+  it("tells the guest when a payment was cancelled or will be refunded", async () => {
+    setRole("guest");
+    mockApi(guestRoutes({
+      "GET /payments/proofs?reservationNo=R-OWN-1": () =>
+        reply(200, { proofs: [proof({ id: "c1", status: "cancelled" }), proof({ id: "c2", status: "refund_due" })] }),
+    }));
+    renderWithToaster(<PaymentsScreen session={guestSession} />);
+
+    expect(await screen.findByText("Cancelled together with the booking.")).toBeInTheDocument();
+    expect(screen.getByText("The booking was cancelled. The hotel will refund this payment.")).toBeInTheDocument();
+  });
+});
+

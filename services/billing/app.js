@@ -4,6 +4,7 @@ import express from 'express';
 import multer from 'multer';
 import { pool } from './db.js';
 import { createPaymentGateway } from './payment-gateway.js';
+import { createOutbox } from './events.js';
 
 const allowedTypes = new Set(['image/png', 'image/jpeg', 'application/pdf']);
 const paymentProofReviewedQueue = 'PaymentProofReviewed';
@@ -33,6 +34,10 @@ function validMoney(amount) {
 function validCurrency(currency) {
   return typeof currency === 'string' && /^[A-Z]{3}$/.test(currency);
 }
+
+const OPEN_RESERVATION = new Set(['pending', 'confirmed']);
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function errorResponse(res, status, error, message) {
   return res.status(status).json({ error, message });
@@ -113,9 +118,15 @@ async function ensureOwnership({ reservationNo, actor }) {
   return { reservation };
 }
 
-function serializeProof(row) {
+function serializeProof(row, actor) {
+  // Guests see the outcome of a review, not which staff member made it.
+  const reviewer = actor?.role === 'guest'
+    ? {}
+    : { reviewedBy: row.reviewed_by, reviewedByRole: row.reviewed_by_role };
   return {
+    ...reviewer,
     id: row.id,
+    paymentNo: row.payment_no,
     reservationNo: row.reservation_no,
     guestId: row.guest_id,
     amount: Number(row.amount),
@@ -125,16 +136,42 @@ function serializeProof(row) {
     fileType: row.file_type,
     fileSize: row.file_size,
     status: row.status,
-    reviewedBy: row.reviewed_by,
     reviewedAt: row.reviewed_at,
     reviewNote: row.review_note,
+    cancelledAt: row.cancelled_at,
+    refundedAt: row.refunded_at,
     createdAt: row.created_at,
   };
 }
 
 async function fetchProof(db, id) {
+  if (!UUID_PATTERN.test(id)) return null;
   const result = await db.query('SELECT * FROM payment_proofs WHERE id = $1', [id]);
   return result.rows[0] || null;
+}
+
+function roundMoney(amount) {
+  return Math.round(Number(amount) * 100) / 100;
+}
+
+async function proofTotals(db, reservationNo, excludeId = null) {
+  const result = await db.query(
+    `SELECT COALESCE(SUM(amount) FILTER (WHERE status = 'approved'), 0)::float AS approved,
+            COALESCE(SUM(amount) FILTER (WHERE status = 'pending'), 0)::float AS pending
+     FROM payment_proofs
+     WHERE reservation_no = $1 AND ($2::uuid IS NULL OR id <> $2::uuid)`,
+    [reservationNo, excludeId]
+  );
+  return result.rows[0];
+}
+
+// Serialises proof uploads and approvals of one reservation so balances cannot be overshot.
+async function lockReservation(client, reservationNo) {
+  await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`proofs:${reservationNo}`]);
+}
+
+function amountStillOwed(reservation) {
+  return roundMoney(Number(reservation.totalAmount) - Number(reservation.depositHeld ?? reservation.depositAmount ?? 0));
 }
 
 async function loadGuestContact(guestId) {
@@ -151,32 +188,23 @@ async function loadGuestContact(guestId) {
   return {
     guestEmail: response.data.email || null,
     guestPhone: response.data.phone || null,
+    guestName: [response.data.firstName, response.data.lastName].filter(Boolean).join(' ') || null,
   };
 }
 
-async function publishPaymentProofReviewed(payload) {
-  const amqp = await import('amqplib');
-  const connection = await amqp.connect(process.env.RABBITMQ_URL || 'amqp://localhost:5672');
-  try {
-    const channel = await connection.createChannel();
-    await channel.assertQueue(paymentProofReviewedQueue, { durable: true });
-    channel.sendToQueue(
-      paymentProofReviewedQueue,
-      Buffer.from(JSON.stringify(payload)),
-      { persistent: true, contentType: 'application/json' }
-    );
-    await channel.close();
-  } finally {
-    await connection.close();
-  }
-}
+// Stored in the outbox first, so the guest's email survives a broker outage.
+export const outbox = createOutbox({ db: pool });
 
 async function sendPaymentProofReviewedNotification(payload) {
-  const contact = await loadGuestContact(payload.guestId);
-  await publishPaymentProofReviewed({
+  const contact = await loadGuestContact(payload.guestId).catch((error) => {
+    console.error(`Guest lookup for notification failed: ${error.message}`);
+    return {};
+  });
+  // Payment confirmations always go to the guest's email when one is on file.
+  await outbox.enqueue(paymentProofReviewedQueue, {
     ...payload,
     ...contact,
-    notificationChannel: process.env.NOTIFICATION_CHANNEL || 'email',
+    notificationChannel: contact.guestEmail ? 'email' : process.env.NOTIFICATION_CHANNEL || 'email',
   });
 }
 
@@ -185,10 +213,22 @@ async function notifyProofReviewIfConfigured(payload) {
   await sendPaymentProofReviewedNotification(payload);
 }
 
+async function markReservationPaid(reservationNo) {
+  const headers = process.env.INTERNAL_TOKEN
+    ? { 'x-internal-token': process.env.INTERNAL_TOKEN }
+    : {};
+  await axios.post(
+    `${serviceUrl()}/reservations/${encodeURIComponent(reservationNo)}/payment-approved`,
+    {},
+    { headers }
+  );
+}
+
 export function createApp({
   db = pool,
   paymentGateway,
-  notifyProofReview = notifyProofReviewIfConfigured
+  notifyProofReview = notifyProofReviewIfConfigured,
+  confirmReservationPayment = markReservationPaid
 } = {}) {
   const app = express();
   app.use(express.json());
@@ -220,9 +260,10 @@ export function createApp({
       });
       const status = decision.approved ? 'authorized' : 'declined';
 
-      await db.query(
+      const inserted = await db.query(
         `INSERT INTO payments (id, type, reservation_no, guest_id, amount, currency, status)
-         VALUES ($1, 'deposit', $2, $3, $4, $5, $6)`,
+         VALUES ($1, 'deposit', $2, $3, $4, $5, $6)
+         RETURNING payment_no`,
         [id, reservationNo, guestId, amount, currency, status]
       );
 
@@ -235,6 +276,7 @@ export function createApp({
 
       return res.status(201).json({
         depositId: id,
+        paymentNo: inserted.rows[0].payment_no,
         status: 'authorized',
         amount,
         currency
@@ -292,9 +334,10 @@ export function createApp({
       }
 
       const refundId = randomUUID();
-      await client.query(
-        `INSERT INTO payments (id, type, deposit_id, amount, currency, status)
-         VALUES ($1, 'refund', $2, $3, $4, 'refunded')`,
+      const inserted = await client.query(
+        `INSERT INTO payments (id, type, reservation_no, deposit_id, amount, currency, status)
+         SELECT $1, 'refund', reservation_no, $2, $3, $4, 'refunded' FROM payments WHERE id = $2
+         RETURNING payment_no`,
         [refundId, depositId, amount, currency]
       );
 
@@ -302,6 +345,7 @@ export function createApp({
       return res.status(201).json({
         refundId,
         depositId,
+        paymentNo: inserted.rows[0].payment_no,
         status: 'refunded',
         amount,
         currency
@@ -311,6 +355,67 @@ export function createApp({
       return next(error);
     } finally {
       client.release();
+    }
+  });
+
+  // Internal (check-out): apply the deposit to the bill.
+  app.post('/deposits/capture', async (req, res, next) => {
+    const reservationNo = String(req.body?.reservationNo || '').trim();
+    if (!reservationNo) return errorResponse(res, 400, 'BadRequest', 'reservationNo is required.');
+    try {
+      const captured = await db.query(
+        `UPDATE payments SET status = 'captured', captured_at = NOW()
+         WHERE reservation_no = $1 AND type = 'deposit' AND status = 'authorized'
+         RETURNING payment_no, amount::float AS amount`,
+        [reservationNo]
+      );
+      return res.status(200).json({
+        captured: captured.rows.map((row) => ({ paymentNo: row.payment_no, amount: row.amount }))
+      });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  // Internal (check-out): the remaining balance was paid at the front desk.
+  app.post('/settlements', async (req, res, next) => {
+    const { reservationNo, guestId, amount, currency } = req.body ?? {};
+    if (!reservationNo || !guestId || !validMoney(amount) || !validCurrency(currency)) {
+      return errorResponse(res, 400, 'BadRequest', 'Valid reservationNo, guestId, amount, and currency are required.');
+    }
+    try {
+      const id = randomUUID();
+      const inserted = await db.query(
+        `INSERT INTO payments (id, type, reservation_no, guest_id, amount, currency, status, captured_at)
+         VALUES ($1, 'settlement', $2, $3, $4, $5, 'captured', NOW())
+         RETURNING payment_no`,
+        [id, reservationNo, guestId, amount, currency]
+      );
+      return res.status(201).json({ id, paymentNo: inserted.rows[0].payment_no, amount, currency, status: 'captured' });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  app.get('/payments/transactions', requireProofActor, async (req, res, next) => {
+    if (!isStaff(req.proofActor.role)) {
+      return errorResponse(res, 403, 'Forbidden', 'Only agents and managers can view transactions.');
+    }
+    const reservationNo = String(req.query.reservationNo || '').trim();
+    if (!reservationNo) return errorResponse(res, 400, 'BadRequest', 'reservationNo is required.');
+    try {
+      const result = await db.query(
+        `SELECT id, payment_no AS "paymentNo", type, amount::float AS amount, TRIM(currency) AS currency,
+                status, created_at AS "createdAt", captured_at AS "capturedAt"
+         FROM payments
+         WHERE reservation_no = $1
+            OR deposit_id IN (SELECT id FROM payments WHERE reservation_no = $1)
+         ORDER BY created_at, payment_no`,
+        [reservationNo]
+      );
+      return res.status(200).json({ transactions: result.rows });
+    } catch (error) {
+      return next(error);
     }
   });
 
@@ -335,27 +440,60 @@ export function createApp({
         return errorResponse(res, status, error, message);
       }
 
-      const proofId = randomUUID();
-      await db.query(
-        `INSERT INTO payment_proofs (
-          id, reservation_no, guest_id, amount, currency, note, file_name,
-          file_type, file_size, file_data, status
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending')`,
-        [
-          proofId,
-          reservationNo,
-          ownership.reservation.guestId,
-          amount,
-          currency,
-          note,
-          req.file.originalname,
-          req.file.mimetype,
-          req.file.size,
-          req.file.buffer,
-        ]
-      );
+      const reservation = ownership.reservation;
+      if (!OPEN_RESERVATION.has(reservation.status)) {
+        return errorResponse(res, 409, 'Conflict', 'Payments cannot be submitted for a cancelled reservation.');
+      }
+      if (String(reservation.currency || '').trim() !== currency) {
+        return errorResponse(res, 400, 'BadRequest', `The payment currency must be ${String(reservation.currency).trim()}.`);
+      }
 
-      return res.status(201).json({ id: proofId, status: 'pending' });
+      const proofId = randomUUID();
+      const client = await db.connect();
+      try {
+        await client.query('BEGIN');
+        await lockReservation(client, reservationNo);
+        const totals = await proofTotals(client, reservationNo);
+        const outstanding = roundMoney(amountStillOwed(reservation) - totals.approved - totals.pending);
+        if (amount > outstanding) {
+          await client.query('ROLLBACK');
+          return errorResponse(
+            res,
+            400,
+            'BadRequest',
+            outstanding > 0
+              ? `The amount exceeds the outstanding balance of ${outstanding.toFixed(2)} ${currency} (including proofs awaiting review).`
+              : 'Nothing is outstanding on this reservation (including proofs awaiting review).'
+          );
+        }
+        await client.query(
+          `INSERT INTO payment_proofs (
+            id, reservation_no, guest_id, amount, currency, note, file_name,
+            file_type, file_size, file_data, status
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending')`,
+          [
+            proofId,
+            reservationNo,
+            reservation.guestId,
+            amount,
+            currency,
+            note,
+            req.file.originalname,
+            req.file.mimetype,
+            req.file.size,
+            req.file.buffer,
+          ]
+        );
+        await client.query('COMMIT');
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw error;
+      } finally {
+        client.release();
+      }
+
+      const stored = await fetchProof(db, proofId);
+      return res.status(201).json({ id: proofId, paymentNo: stored.payment_no, status: 'pending' });
     } catch (error) {
       if (error.code === 'LIMIT_FILE_SIZE') {
         return errorResponse(res, 413, 'PayloadTooLarge', 'The uploaded file must be 5 MB or smaller.');
@@ -363,6 +501,79 @@ export function createApp({
       if (error.code === 'INVALID_FILE_TYPE') {
         return errorResponse(res, 400, 'BadRequest', 'Only PNG, JPEG, or PDF files are allowed.');
       }
+      return next(error);
+    }
+  });
+
+  // Internal: proof totals for one reservation (the gateway does not expose this route).
+  app.get('/payments/reservations/:no/totals', async (req, res, next) => {
+    try {
+      const totals = await proofTotals(db, req.params.no);
+      return res.status(200).json({
+        reservationNo: req.params.no,
+        approvedTotal: roundMoney(totals.approved),
+        pendingTotal: roundMoney(totals.pending),
+      });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  // Internal: the reservation was cancelled, so its proofs are settled too.
+  // Idempotent, so the reservation service can safely call it again.
+  app.post('/payments/reservations/:no/cancel', async (req, res, next) => {
+    const client = await db.connect();
+    try {
+      await client.query('BEGIN');
+      await lockReservation(client, req.params.no);
+      const cancelled = await client.query(
+        `UPDATE payment_proofs SET status = 'cancelled', cancelled_at = NOW()
+         WHERE reservation_no = $1 AND status = 'pending'
+         RETURNING payment_no`,
+        [req.params.no]
+      );
+      const refundDue = await client.query(
+        `UPDATE payment_proofs SET status = 'refund_due', cancelled_at = NOW()
+         WHERE reservation_no = $1 AND status = 'approved'
+         RETURNING payment_no, amount::float AS amount`,
+        [req.params.no]
+      );
+      await client.query('COMMIT');
+      return res.status(200).json({
+        reservationNo: req.params.no,
+        cancelledProofs: cancelled.rows.map((row) => row.payment_no),
+        refundDue: refundDue.rows.map((row) => ({ paymentNo: row.payment_no, amount: row.amount })),
+        refundDueTotal: roundMoney(refundDue.rows.reduce((sum, row) => sum + row.amount, 0)),
+      });
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      return next(error);
+    } finally {
+      client.release();
+    }
+  });
+
+  // Staff confirm that money owed back after a cancellation was returned.
+  app.put('/payments/proofs/:id/refund', async (req, res, next) => {
+    const actor = actorFromRequest(req);
+    if (!isStaff(actor.role)) {
+      return errorResponse(res, 403, 'Forbidden', 'Only agents and managers can record refunds.');
+    }
+    try {
+      if (!UUID_PATTERN.test(req.params.id)) {
+        return errorResponse(res, 404, 'NotFound', 'Payment proof not found.');
+      }
+      const updated = await db.query(
+        `UPDATE payment_proofs SET status = 'refunded', refunded_at = NOW(), refunded_by = $2
+         WHERE id = $1 AND status = 'refund_due'
+         RETURNING *`,
+        [req.params.id, actor.id]
+      );
+      if (updated.rowCount) return res.status(200).json({ proof: serializeProof(updated.rows[0], actor) });
+      const proof = await fetchProof(db, req.params.id);
+      if (!proof) return errorResponse(res, 404, 'NotFound', 'Payment proof not found.');
+      return errorResponse(res, 409, 'Conflict', 'Only payments with a refund due can be marked refunded.');
+    } catch (error) {
       return next(error);
     }
   });
@@ -384,6 +595,11 @@ export function createApp({
         values.push(String(reservationNo));
       }
 
+      if (req.query.q) {
+        clauses.push(`(reservation_no ILIKE $${values.length + 1} OR payment_no ILIKE $${values.length + 1})`);
+        values.push(`%${String(req.query.q).trim()}%`);
+      }
+
       if (status) {
         clauses.push('status = $' + (values.length + 1));
         values.push(String(status));
@@ -391,7 +607,7 @@ export function createApp({
 
       const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
       const result = await db.query(`SELECT * FROM payment_proofs ${where} ORDER BY created_at DESC, id DESC`, values);
-      return res.status(200).json({ proofs: result.rows.map(serializeProof) });
+      return res.status(200).json({ proofs: result.rows.map((row) => serializeProof(row, actor)) });
     } catch (error) {
       return next(error);
     }
@@ -436,7 +652,9 @@ export function createApp({
       const client = await db.connect();
       try {
         await client.query('BEGIN');
-        const proofResult = await client.query('SELECT * FROM payment_proofs WHERE id = $1 FOR UPDATE', [req.params.id]);
+        const proofResult = UUID_PATTERN.test(req.params.id)
+          ? await client.query('SELECT * FROM payment_proofs WHERE id = $1 FOR UPDATE', [req.params.id])
+          : { rowCount: 0, rows: [] };
         if (!proofResult.rowCount) {
           await client.query('ROLLBACK');
           return errorResponse(res, 404, 'NotFound', 'Payment proof not found.');
@@ -448,26 +666,81 @@ export function createApp({
           return errorResponse(res, 409, 'Conflict', 'Only pending proofs can be reviewed.');
         }
 
+        let reservation = null;
+        let approvedTotal = null;
+        if (decision === 'approved') {
+          await lockReservation(client, proof.reservation_no);
+          reservation = await loadReservation(proof.reservation_no);
+          if (!reservation) {
+            await client.query('ROLLBACK');
+            return errorResponse(res, 409, 'Conflict', 'The reservation for this proof no longer exists; reject it instead.');
+          }
+          if (!OPEN_RESERVATION.has(reservation.status)) {
+            await client.query('ROLLBACK');
+            return errorResponse(res, 409, 'Conflict', 'The reservation is cancelled; reject this proof instead.');
+          }
+          const totals = await proofTotals(client, proof.reservation_no, proof.id);
+          const outstanding = roundMoney(amountStillOwed(reservation) - totals.approved);
+          if (Number(proof.amount) > outstanding) {
+            await client.query('ROLLBACK');
+            return errorResponse(
+              res,
+              409,
+              'Conflict',
+              `Approving this proof would exceed the outstanding balance of ${Math.max(0, outstanding).toFixed(2)} ${proof.currency.trim()}.`
+            );
+          }
+          approvedTotal = roundMoney(totals.approved + Number(proof.amount));
+        }
+
         const updated = await client.query(
           `UPDATE payment_proofs
-           SET status = $2, reviewed_by = $3, reviewed_at = NOW(), review_note = $4
+           SET status = $2, reviewed_by = $3, reviewed_at = NOW(), review_note = $4, reviewed_by_role = $5
            WHERE id = $1
            RETURNING *`,
-          [req.params.id, decision, actor.id, decision === 'rejected' ? note : (note || null)]
+          [req.params.id, decision, actor.id, decision === 'rejected' ? note : (note || null), actor.role]
         );
+
+        // An approved payment confirms a pending booking; both succeed or neither does.
+        const bookingConfirmed = decision === 'approved' && reservation.status === 'pending';
+        if (decision === 'approved') {
+          try {
+            await confirmReservationPayment(proof.reservation_no);
+          } catch (error) {
+            await client.query('ROLLBACK');
+            console.error(error);
+            return errorResponse(res, 502, 'BadGateway', 'The booking could not be confirmed, so the payment was not approved. Please try again.');
+          }
+        }
         await client.query('COMMIT');
+
+        const paidToDate = reservation
+          ? roundMoney(Number(reservation.depositHeld ?? 0) + approvedTotal)
+          : null;
         void Promise.resolve()
           .then(() => notifyProofReview({
             reservationNo: proof.reservation_no,
+            paymentNo: proof.payment_no,
+            bookingConfirmed,
             guestId: proof.guest_id,
             amount: Number(proof.amount),
             currency: proof.currency.trim(),
             status: decision,
             reviewNote: updated.rows[0].review_note,
+            reviewedAt: updated.rows[0].reviewed_at,
             event: 'PaymentProofReviewed',
+            ...(reservation ? {
+              checkIn: reservation.checkIn,
+              checkOut: reservation.checkOut,
+              roomTypeId: reservation.roomTypeId,
+              roomNumber: reservation.roomNumber ?? null,
+              totalAmount: Number(reservation.totalAmount),
+              paidToDate,
+              balanceDue: Math.max(0, roundMoney(Number(reservation.totalAmount) - paidToDate)),
+            } : {}),
           }))
-          .catch(() => console.error('Failed to send payment proof review notification.'));
-        return res.status(200).json({ proof: serializeProof(updated.rows[0]) });
+          .catch((error) => console.error('Failed to send payment proof review notification:', error.message));
+        return res.status(200).json({ proof: serializeProof(updated.rows[0]), bookingConfirmed });
       } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
         throw error;

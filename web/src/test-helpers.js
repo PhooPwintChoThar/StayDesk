@@ -1,4 +1,7 @@
+import { createElement, Fragment } from "react";
+import { render } from "@testing-library/react";
 import { vi } from "vitest";
+import Toaster from "./Toaster.jsx";
 
 export const reply = (status, body, extra = {}) => ({
   ok: status < 400,
@@ -74,3 +77,6 @@ export function stubConfirm(...answers) {
   vi.stubGlobal("confirm", confirm);
   return confirm;
 }
+
+// Screens tested on their own need the app's pop-up area to show notifications.
+export const renderWithToaster = (ui) => render(createElement(Fragment, null, ui, createElement(Toaster)));

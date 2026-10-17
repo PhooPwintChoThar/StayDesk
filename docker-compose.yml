@@ -26,12 +26,22 @@ services:
       timeout: 5s
       retries: 10
 
+  mailpit:
+    image: axllent/mailpit:v1.21
+    ports:
+      - "127.0.0.1:8025:8025"
+      - "127.0.0.1:1025:1025"
+
   gateway:
     build: ./services/gateway
+    restart: unless-stopped
     ports:
       - "3010:3000"
     environment:
       PORT: 3000
+      TZ: ${HOTEL_TIMEZONE:-Asia/Bangkok}
+      # Services reject calls that do not come through the gateway or another service.
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN:-dev-internal-token-change-me}
       JWT_SECRET: ${JWT_SECRET:-dev-secret-change-me}
       ALLOW_DEV_LOGIN: ${ALLOW_DEV_LOGIN:-false}
       GUEST_SERVICE_URL: http://guest:3000
@@ -48,12 +58,17 @@ services:
 
   guest:
     build: ./services/guest
+    restart: unless-stopped
     ports:
       - "127.0.0.1:3001:3000"
     environment:
       PORT: 3000
+      TZ: ${HOTEL_TIMEZONE:-Asia/Bangkok}
+      # Services reject calls that do not come through the gateway or another service.
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN:-dev-internal-token-change-me}
       DATABASE_URL: "postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/guest_db"
       RABBITMQ_URL: amqp://rabbitmq:5672
+      RESERVATION_SERVICE_URL: http://reservation:3000
     depends_on:
       postgres:
         condition: service_healthy
@@ -62,10 +77,14 @@ services:
 
   reservation:
     build: ./services/reservation
+    restart: unless-stopped
     ports:
       - "127.0.0.1:3002:3000"
     environment:
       PORT: 3000
+      TZ: ${HOTEL_TIMEZONE:-Asia/Bangkok}
+      # Services reject calls that do not come through the gateway or another service.
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN:-dev-internal-token-change-me}
       DATABASE_URL: "postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/reservation_db"
       RABBITMQ_URL: amqp://rabbitmq:5672
       CANCELLATION_POLICY: ${CANCELLATION_POLICY:-full}
@@ -77,10 +96,14 @@ services:
 
   room-rate:
     build: ./services/room-rate
+    restart: unless-stopped
     ports:
       - "127.0.0.1:3003:3000"
     environment:
       PORT: 3000
+      TZ: ${HOTEL_TIMEZONE:-Asia/Bangkok}
+      # Services reject calls that do not come through the gateway or another service.
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN:-dev-internal-token-change-me}
       DATABASE_URL: "postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/room_rate_db"
       RABBITMQ_URL: amqp://rabbitmq:5672
     depends_on:
@@ -91,10 +114,14 @@ services:
 
   billing:
     build: ./services/billing
+    restart: unless-stopped
     ports:
       - "127.0.0.1:3004:3000"
     environment:
       PORT: 3000
+      TZ: ${HOTEL_TIMEZONE:-Asia/Bangkok}
+      # Services reject calls that do not come through the gateway or another service.
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN:-dev-internal-token-change-me}
       DATABASE_URL: "postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/payment_db"
       RABBITMQ_URL: amqp://rabbitmq:5672
       NOTIFICATION_CHANNEL: ${NOTIFICATION_CHANNEL:-email}
@@ -106,14 +133,29 @@ services:
 
   notification:
     build: ./services/notification
+    restart: unless-stopped
     ports:
       - "127.0.0.1:3005:3000"
     environment:
       PORT: 3000
+      TZ: ${HOTEL_TIMEZONE:-Asia/Bangkok}
+      # Services reject calls that do not come through the gateway or another service.
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN:-dev-internal-token-change-me}
       DATABASE_URL: "postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/notification_db"
       RABBITMQ_URL: amqp://rabbitmq:5672
       NOTIFICATION_CHANNEL: ${NOTIFICATION_CHANNEL:-email}
+      ROOM_RATE_SERVICE_URL: http://room-rate:3000
+      # Defaults deliver to the local Mailpit inbox (http://localhost:8025).
+      # Set these in .env to send real email, e.g. through Gmail with an app password.
+      SMTP_HOST: ${SMTP_HOST:-mailpit}
+      SMTP_PORT: ${SMTP_PORT:-1025}
+      SMTP_SECURE: ${SMTP_SECURE:-false}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      MAIL_FROM: ${MAIL_FROM:-StayDesk Hotel <no-reply@staydesk.local>}
     depends_on:
+      mailpit:
+        condition: service_started
       postgres:
         condition: service_healthy
       rabbitmq:

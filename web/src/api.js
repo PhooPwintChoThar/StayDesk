@@ -4,6 +4,13 @@ const API_BASE_URL = (
 
 const DEV_ROLE_SWITCH = import.meta.env.VITE_DEV_ROLE_SWITCH === "true";
 
+// Absolute URL for a public gateway path such as a room photo.
+export function assetUrl(path) {
+  return `${API_BASE_URL}${path}`;
+}
+
+// Facade: the single place the monolithic UI talks to the API gateway (tokens,
+// JSON/FormData, errors). Observer: screens subscribe to session changes.
 let session = null;
 let devRole = null;
 let tokenPromise;

@@ -13,7 +13,7 @@ const stored = {
   checkOut: "2027-03-13",
   totalAmount: 450,
   currency: "USD",
-  status: "confirmed",
+  status: "pending",
 };
 
 const quote = { refundAmount: 135, feeAmount: 15, currency: "USD", rule: "partial", hoursBeforeCheckIn: 72 };
@@ -78,6 +78,18 @@ describe("guest bookings", () => {
     await userEvent.click(screen.getByRole("button", { name: "Actions for R-STORED" }));
     expect(screen.getByRole("menuitem", { name: "Modify" })).toBeEnabled();
     expect(screen.getByRole("menuitem", { name: "Cancel" })).toBeEnabled();
+    expect(within(table).getByText("pending payment")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Check in" })).not.toBeInTheDocument();
+  });
+
+  it("does not let a guest cancel a booking whose payment is approved", async () => {
+    setRole("guest");
+    mockApi({ "GET /reservations": () => reply(200, { reservations: [{ ...stored, status: "confirmed" }] }) });
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "Actions for R-STORED" }));
+
+    expect(screen.getByRole("menuitem", { name: "Cancel" })).toBeDisabled();
   });
 
   it("books under the signed-in guest and refreshes the complete booking list", async () => {
@@ -108,13 +120,14 @@ describe("guest bookings", () => {
     await userEvent.type(screen.getByLabelText("Check-in"), "2027-04-01");
     await userEvent.type(screen.getByLabelText("Check-out"), "2027-04-03");
     await userEvent.click(screen.getByRole("button", { name: "Search availability" }));
-    await userEvent.click(await screen.findByRole("button", { name: "Select" }));
+    await userEvent.click(await screen.findByRole("button", { name: /^Select/ }));
 
     const email = screen.getByLabelText("Email");
     expect(email).toHaveValue("guest@example.com");
     expect(email).toHaveAttribute("readonly");
     await userEvent.type(screen.getByLabelText("First name"), "Test");
     await userEvent.type(screen.getByLabelText("Last name"), "Guest");
+    await userEvent.type(screen.getByLabelText("Passport or ID number"), "P1234567");
     await userEvent.click(screen.getByRole("button", { name: "Book room" }));
 
     const table = screen.getByRole("table");
@@ -243,7 +256,7 @@ describe("room search and guest records", () => {
     await userEvent.type(screen.getByLabelText("Check-in"), "2027-03-10");
     await userEvent.type(screen.getByLabelText("Check-out"), "2027-03-12");
     await userEvent.click(screen.getByRole("button", { name: "Search availability" }));
-    await userEvent.click(await screen.findByRole("button", { name: "Select" }));
+    await userEvent.click(await screen.findByRole("button", { name: /^Select/ }));
     await screen.findByLabelText("First name");
   }
 
@@ -281,15 +294,14 @@ describe("room search and guest records", () => {
 
   async function openGuestProfile() {
     await userEvent.click(await screen.findByRole("button", { name: /Guests$/ }));
-    await userEvent.type(screen.getByLabelText("Name, email or phone"), "test");
-    await userEvent.click(screen.getByRole("button", { name: "Search guests" }));
-    await userEvent.click(await screen.findByRole("button", { name: "View stays" }));
-    await screen.findByText(/Stay history:/);
+    await userEvent.click(await screen.findByRole("button", { name: /bookings for/ }));
+    await screen.findByText(/^Bookings for /);
   }
 
   const guestRoutes = (extra = {}) =>
     routes({
-      "GET /guests/search": () => reply(200, { guests: [guestRecord] }),
+      "GET /guests": () => reply(200, { guests: [guestRecord] }),
+      "GET /reservations/guest-counts": () => reply(200, { counts: [] }),
       ...extra,
     });
 
@@ -345,7 +357,7 @@ describe("guest My profile", () => {
     await userEvent.type(screen.getByLabelText("Phone"), "+66 81 999 0000");
     await userEvent.click(screen.getByRole("button", { name: "Save profile" }));
 
-    expect(await screen.findByRole("status")).toHaveTextContent("Profile updated.");
+    expect(await screen.findByRole("status")).toHaveTextContent("Profile updated");
     expect(calls("PUT", "/guests/guest-1")).toHaveLength(1);
     expect(JSON.parse(calls("PUT", "/guests/guest-1")[0][1].body)).toMatchObject({
       email: "guest@example.com",

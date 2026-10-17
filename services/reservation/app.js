@@ -1,54 +1,45 @@
 import { randomUUID } from "node:crypto";
-import axios from "axios";
 import express from "express";
 import { pool } from "./db.js";
 import { HttpError, runSaga } from "./saga.js";
 import { createCancellationPolicy } from "./cancellation-policy.js";
+import { createServiceHttp } from "./http-client.js";
+import { createServiceClients } from "./service-clients.js";
+import { stateOf, stayOf } from "./reservation-state.js";
+import { restoreMemento, saveMemento } from "./memento.js";
+import { refundPlan } from "./refund-plan.js";
+import { domainEvents } from "./events.js";
 
 const DEPOSIT_PERCENT = 30;
+const isStaff = (role) => role === "agent" || role === "manager";
 
-const url = (names, fallback) => {
-  for (const name of names) {
-    if (process.env[name]) return process.env[name].replace(/\/$/, "");
-  }
-  return fallback;
-};
-
-const roomRateUrl = () =>
-  url(["ROOM_RATE_URL", "ROOM_RATE_SERVICE_URL"], "http://room-rate:3000");
-const guestUrl = () =>
-  url(["GUEST_URL", "GUEST_SERVICE_URL"], "http://guest:3000");
-const billingUrl = () =>
-  url(["BILLING_URL", "BILLING_SERVICE_URL"], "http://billing:3000");
+function validDate(value) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value ?? "")) return false;
+  const date = new Date(`${value}T00:00:00Z`);
+  return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === value;
+}
 
 function validDates(checkIn, checkOut) {
-  if (
-    !/^\d{4}-\d{2}-\d{2}$/.test(checkIn ?? "") ||
-    !/^\d{4}-\d{2}-\d{2}$/.test(checkOut ?? "")
-  )
-    return false;
+  return validDate(checkIn) && validDate(checkOut) && checkOut > checkIn;
+}
 
-  const start = new Date(`${checkIn}T00:00:00Z`);
-  const end = new Date(`${checkOut}T00:00:00Z`);
+function localDate(now) {
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+}
 
-  return (
-    Number.isFinite(start.getTime()) &&
-    Number.isFinite(end.getTime()) &&
-    start.toISOString().slice(0, 10) === checkIn &&
-    end.toISOString().slice(0, 10) === checkOut &&
-    end > start
-  );
+function roundMoney(amount) {
+  return Math.round(Number(amount) * 100) / 100;
 }
 
 function totalPrice(nightlyRate, checkIn, checkOut) {
   const nights =
     (Date.parse(`${checkOut}T00:00:00Z`) - Date.parse(`${checkIn}T00:00:00Z`)) /
     86_400_000;
-  return Math.round(Number(nightlyRate) * nights * 100) / 100;
+  return roundMoney(Number(nightlyRate) * nights);
 }
 
 function depositPrice(amount) {
-  return Math.round(((amount * DEPOSIT_PERCENT) / 100) * 100) / 100;
+  return roundMoney((amount * DEPOSIT_PERCENT) / 100);
 }
 
 function fail(res, status, error, message) {
@@ -59,6 +50,61 @@ function parseGuests(value) {
   if (value == null || value === "") return null;
   const guests = Number(value);
   return Number.isInteger(guests) && guests >= 1 ? guests : undefined;
+}
+
+// Details for guests 2..n of a booking: [{ name, idDocument }]. undefined = not sent.
+function parseAdditionalGuests(value) {
+  if (value === undefined || value === null) return undefined;
+  if (!Array.isArray(value)) return { error: true };
+  const list = value.map((item) => ({
+    name: typeof item?.name === "string" ? item.name.trim() : "",
+    idDocument: typeof item?.idDocument === "string" ? item.idDocument.trim() : "",
+  }));
+  return list.some((item) => !item.name || !item.idDocument) ? { error: true } : list;
+}
+
+function guestDetailsError(count) {
+  return count > 1
+    ? `Enter the name and passport or ID number for each of the ${count} guests.`
+    : "Only the guest who books is needed for one guest.";
+}
+
+function maskDocument(value) {
+  const trimmed = String(value ?? "").trim();
+  if (trimmed.length <= 4) return "****";
+  return `${"*".repeat(trimmed.length - 4)}${trimmed.slice(-4)}`;
+}
+
+async function loadAdditionalGuests(db, reservationNo, role) {
+  const result = await db.query(
+    `SELECT position, full_name AS name, id_document AS "idDocument"
+     FROM reservation_guests WHERE reservation_no = $1 ORDER BY position`,
+    [reservationNo],
+  );
+  // Same rule as guest profiles: agents see only the last four characters.
+  return result.rows.map((row) =>
+    role === "agent" ? { ...row, idDocument: maskDocument(row.idDocument) } : row,
+  );
+}
+
+async function replaceAdditionalGuests(client, reservationNo, list) {
+  await client.query("DELETE FROM reservation_guests WHERE reservation_no = $1", [reservationNo]);
+  for (const [index, item] of list.entries()) {
+    await client.query(
+      `INSERT INTO reservation_guests (id, reservation_no, position, full_name, id_document)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [randomUUID(), reservationNo, index + 2, item.name, item.idDocument],
+    );
+  }
+}
+
+async function settledTotal(db, reservationNo) {
+  const result = await db.query(
+    `SELECT COALESCE(SUM(amount), 0)::float AS total
+     FROM reservation_payments WHERE reservation_no = $1 AND type = 'settlement'`,
+    [reservationNo],
+  );
+  return Number(result.rows[0].total);
 }
 
 function actorFromRequest(req) {
@@ -85,9 +131,28 @@ function currencyValue(reservation) {
 function quoteFromHours(hoursBeforeCheckIn, heldAmount, overridePercent) {
   const effectivePercent = overridePercent ?? (hoursBeforeCheckIn >= 48 ? 100 : hoursBeforeCheckIn >= 24 ? 50 : 0);
   const refundAmount = Math.round((Number(heldAmount) * effectivePercent) * 100) / 10000;
-  const feeAmount = Math.round((Number(heldAmount) - refundAmount) * 100) / 100;
+  const feeAmount = roundMoney(Number(heldAmount) - refundAmount);
   return { refundAmount, feeAmount };
 }
+
+const reservationSelect = `
+  reservation_no AS "reservationNo", guest_id AS "guestId",
+  room_type_id AS "roomTypeId", room_id AS "roomId", room_number AS "roomNumber",
+  to_char(check_in, 'YYYY-MM-DD') AS "checkIn",
+  to_char(check_out, 'YYYY-MM-DD') AS "checkOut",
+  total_amount::float AS "totalAmount",
+  deposit_id AS "depositId", deposit_amount::float AS "depositAmount",
+  COALESCE(deposit_net, deposit_amount)::float AS "depositHeld",
+  TRIM(currency) AS currency, status, guests,
+  created_at AS "createdAt", confirmed_at AS "confirmedAt",
+  checked_in_at AS "checkedInAt", checked_out_at AS "checkedOutAt"
+`;
+
+// Raw row plus calendar dates as text: pg turns DATE columns into JS Dates otherwise.
+const rawSelect = `
+  *, to_char(check_in, 'YYYY-MM-DD') AS "checkInDate",
+  to_char(check_out, 'YYYY-MM-DD') AS "checkOutDate"
+`;
 
 async function loadReservation(db, reservationNo) {
   const result = await db.query(
@@ -96,6 +161,14 @@ async function loadReservation(db, reservationNo) {
             cancellation_fee::float AS "cancellationFee"
      FROM reservations
      WHERE reservation_no = $1`,
+    [reservationNo],
+  );
+  return result.rows[0] || null;
+}
+
+async function loadRawReservation(db, reservationNo) {
+  const result = await db.query(
+    `SELECT ${rawSelect} FROM reservations WHERE reservation_no = $1`,
     [reservationNo],
   );
   return result.rows[0] || null;
@@ -136,26 +209,6 @@ async function loadPaymentSources(db, reservation) {
   return result.rows;
 }
 
-function allocateRefundAmount(sources, amount) {
-  let remaining = Number(amount);
-  const allocations = [];
-
-  for (const source of sources) {
-    if (remaining <= 0) break;
-    const available = Math.max(0, Number(source.amount) - Number(source.refunded || 0));
-    if (available <= 0) continue;
-    const used = Math.min(remaining, available);
-    allocations.push({ source, amount: used });
-    remaining = Math.round((remaining - used) * 100) / 100;
-  }
-
-  if (remaining > 0) {
-    throw new Error('Held amount is inconsistent with recorded deposits.');
-  }
-
-  return allocations;
-}
-
 async function writeLedgerRow(client, {
   reservationNo,
   type,
@@ -186,44 +239,6 @@ async function writeLedgerRow(client, {
   );
 }
 
-async function authorizeTopUp({ http, reservationNo, guestId, amount, currency }) {
-  const response = await http.post(`${billingUrl()}/deposits`, {
-    reservationNo,
-    guestId,
-    amount,
-    currency,
-  });
-  return response.data.id ?? response.data.depositId;
-}
-
-async function refundAcrossSources({ http, reservationNo, sources, amount, currency }) {
-  const allocations = allocateRefundAmount(sources, amount);
-  const refunds = [];
-
-  for (const allocation of allocations) {
-    const response = await http.post(`${billingUrl()}/refunds`, {
-      depositId: allocation.source.billingPaymentId,
-      amount: allocation.amount,
-      currency,
-    });
-    refunds.push({
-      source: allocation.source,
-      amount: allocation.amount,
-      refundId: response.data.refundId ?? response.data.id,
-    });
-  }
-
-  return refunds;
-}
-
-async function loadApprovedProofsTotal(http, reservationNo) {
-  const response = await http.get(`${billingUrl()}/payments/proofs`, {
-    params: { reservationNo, status: 'approved' },
-  });
-  const proofs = Array.isArray(response.data?.proofs) ? response.data.proofs : [];
-  return proofs.reduce((sum, proof) => sum + Number(proof.amount || 0), 0);
-}
-
 function notificationPayload(reservation, extra = {}) {
   const notificationChannel =
     reservation.notificationChannel ||
@@ -234,12 +249,21 @@ function notificationPayload(reservation, extra = {}) {
   return {
     reservationNo: reservation.reservationNo,
     guestId: reservation.guestId,
+    guestName: reservation.guestName ?? null,
     guestEmail: reservation.guestEmail ?? null,
     guestPhone: reservation.guestPhone ?? null,
     roomTypeId: reservation.roomTypeId,
+    roomNumber: reservation.roomNumber ?? null,
     checkIn: reservation.checkIn,
     checkOut: reservation.checkOut,
+    guests: reservation.guests ?? null,
     totalAmount: Number(reservation.totalAmount),
+    depositAmount: reservation.depositAmount == null ? null : Number(reservation.depositAmount),
+    refundAmount: extra.refundAmount ?? null,
+    statement: extra.statement ?? null,
+    cancelledProofs: extra.cancelledProofs ?? [],
+    proofRefundDue: extra.proofRefundDue ?? 0,
+    cancellationFee: extra.cancellationFee ?? null,
     currency: currencyValue(reservation),
     channel: notificationChannel,
     notificationChannel,
@@ -248,55 +272,14 @@ function notificationPayload(reservation, extra = {}) {
   };
 }
 
-const reservationSelect = `
-  reservation_no AS "reservationNo", guest_id AS "guestId",
-  room_type_id AS "roomTypeId",
-  to_char(check_in, 'YYYY-MM-DD') AS "checkIn",
-  to_char(check_out, 'YYYY-MM-DD') AS "checkOut",
-  total_amount::float AS "totalAmount",
-  deposit_id AS "depositId", deposit_amount::float AS "depositAmount",
-  COALESCE(deposit_net, deposit_amount)::float AS "depositHeld",
-  currency, status, guests
-`;
-
-async function publishToQueue(queueName, payload) {
-  const amqp = await import("amqplib");
-  const connection = await amqp.connect(
-    process.env.RABBITMQ_URL || "amqp://localhost:5672",
-  );
-
-  try {
-    const channel = await connection.createChannel();
-    await channel.assertQueue(queueName, { durable: true });
-    channel.sendToQueue(
-      queueName,
-      Buffer.from(JSON.stringify(payload)),
-      { persistent: true, contentType: "application/json" },
-    );
-    await channel.close();
-  } finally {
-    await connection.close();
-  }
-}
-
-async function publishConfirmed(payload) {
-  return publishToQueue("ReservationConfirmed", payload);
-}
-
-async function publishBestEffort(queueName, payload) {
-  try {
-    await publishToQueue(queueName, payload);
-  } catch (error) {
-    console.error(error);
-  }
-}
-
 export function createApp({
   db = pool,
-  http = axios,
-  publishEvent = publishConfirmed,
-  publishNotification = process.env.RABBITMQ_URL ? publishBestEffort : async () => {},
+  http = createServiceHttp(),
+  // Output ports: the app announces events; server.js subscribes the outbox.
+  publishEvent = (payload) => domainEvents.publish("ReservationConfirmed", payload),
+  publishNotification = (queue, payload) => domainEvents.publish(queue, payload),
   cancellationPolicy = createCancellationPolicy(),
+  clock = () => new Date(),
 } = {}) {
   const app = express();
   app.use(express.json());
@@ -306,30 +289,41 @@ export function createApp({
     return res.status(401).json({ error: 'Unauthorized' });
   });
 
-  const releaseHold = async (id) => {
-    if (!id) return;
-    try {
-      await http.delete(`${roomRateUrl()}/holds/${id}`);
-    } catch (err) {
-      const status = err.response?.status;
-      if (status !== 404 && status !== 409) throw err;
-    }
-  };
+  const today = () => localDate(clock());
 
-  async function findAvailability(checkIn, checkOut, roomTypeId, guests, excludeHoldId) {
-    const availabilityResult = await http.get(`${roomRateUrl()}/availability`, {
-      params: {
-        checkIn,
-        checkOut,
-        roomTypeId,
-        guests: guests || undefined,
-        excludeHoldId: excludeHoldId || undefined,
-      },
+  const services = createServiceClients(http);
+
+  const releaseHoldBestEffort = (id) =>
+    services.rooms.release(id).catch((error) => {
+      console.error(`Failed to release hold ${id}:`, error.message);
     });
-    return availabilityResult.data.availability?.find(
-      (item) => item.roomTypeId === roomTypeId,
-    );
+
+  const loadGuestContact = (guestId) => services.guests.contact(guestId);
+
+  // A cancelled booking's payment proofs are cancelled too. Failures are logged
+  // and retried when the cancellation is requested again.
+  const cancelProofsBestEffort = (reservationNo) =>
+    services.billing.cancelProofs(reservationNo).catch((error) => {
+      console.error(`Failed to cancel payment proofs for ${reservationNo}:`, error.message);
+      return null;
+    });
+
+  // Plan the whole refund first (Iterator), so an inconsistent ledger is caught
+  // before any money moves.
+  async function refundAcrossSources(sources, amount, currency) {
+    const refunds = [];
+    for (const { source, amount: part } of [...refundPlan(sources, amount)]) {
+      const refundId = await services.billing.refund({
+        depositId: source.billingPaymentId,
+        amount: part,
+        currency,
+      });
+      refunds.push({ source, amount: part, refundId });
+    }
+    return refunds;
   }
+
+  const ruleContext = (reservation, role) => ({ reservation: stayOf(reservation), today: today(), role });
 
   app.get("/health", (_req, res) => res.status(200).json({ status: "ok" }));
 
@@ -346,6 +340,17 @@ export function createApp({
         "Valid guest, room type, and dates are required.",
       );
     }
+    if (checkIn < today()) {
+      return fail(res, 400, "BadRequest", "Check-in cannot be in the past.");
+    }
+    if (typeof guest.idDocument !== "string" || !guest.idDocument.trim()) {
+      return fail(res, 400, "BadRequest", "A passport or ID number is required to book.");
+    }
+    const partySize = guests ?? 1;
+    const additionalGuests = parseAdditionalGuests(req.body?.additionalGuests) ?? [];
+    if (additionalGuests.error || additionalGuests.length !== partySize - 1) {
+      return fail(res, 400, "BadRequest", guestDetailsError(partySize));
+    }
 
     const reservationNo = `R-${randomUUID()}`;
 
@@ -353,17 +358,14 @@ export function createApp({
       const result = await runSaga([
         {
           async execute() {
-            const availability = await findAvailability(
-              checkIn,
-              checkOut,
-              roomTypeId,
-              guests,
-            );
+            const availability = await services.rooms.availability({ checkIn, checkOut, roomTypeId, guests });
             if (!availability?.available || availability.roomsAvailable < 1) {
               throw new HttpError(
                 409,
                 "Conflict",
-                "No rooms are available for those dates.",
+                guests
+                  ? `No rooms of that type are available for ${guests} guest(s) on those dates.`
+                  : "No rooms are available for those dates.",
               );
             }
             const amount = totalPrice(availability.nightlyRate, checkIn, checkOut);
@@ -376,56 +378,30 @@ export function createApp({
         },
         {
           async execute() {
-            const holdResult = await http.post(`${roomRateUrl()}/holds`, {
-              roomTypeId,
-              checkIn,
-              checkOut,
-            });
-            return { holdId: holdResult.data.id };
+            return services.rooms.hold({ roomTypeId, checkIn, checkOut });
           },
           async compensate(ctx) {
-            await releaseHold(ctx.holdId);
+            await services.rooms.release(ctx.holdId);
           },
         },
         {
           async execute() {
-            const guestResult = await http.post(
-              `${guestUrl()}/guests/get-or-create`,
-              guest,
-            );
-            return {
-              guestId: guestResult.data.id,
-              guestEmail: guestResult.data.email || guest.email,
-              guestPhone: guestResult.data.phone || guest.phone,
-            };
+            return services.guests.getOrCreate(guest);
           },
         },
         {
           async execute(ctx) {
-            try {
-              const depositResult = await http.post(`${billingUrl()}/deposits`, {
-                reservationNo,
-                guestId: ctx.guestId,
-                amount: ctx.depositAmount,
-                currency: ctx.currency,
-              });
-              return {
-                depositId: depositResult.data.id ?? depositResult.data.depositId,
-              };
-            } catch (err) {
-              if (err.response?.status === 402) {
-                throw new HttpError(
-                  402,
-                  "PaymentDeclined",
-                  "The deposit was declined.",
-                );
-              }
-              throw err;
-            }
+            const depositId = await services.billing.authorize({
+              reservationNo,
+              guestId: ctx.guestId,
+              amount: ctx.depositAmount,
+              currency: ctx.currency,
+            });
+            return { depositId };
           },
           async compensate(ctx) {
             if (!ctx.depositId) return;
-            await http.post(`${billingUrl()}/refunds`, {
+            await services.billing.refund({
               depositId: ctx.depositId,
               amount: ctx.depositAmount,
               currency: ctx.currency,
@@ -439,13 +415,15 @@ export function createApp({
               await client.query('BEGIN');
               await client.query(
                 `INSERT INTO reservations
-                  (reservation_no, guest_id, room_type_id, hold_id, check_in, check_out,
+                  (reservation_no, guest_id, room_type_id, room_id, room_number, hold_id, check_in, check_out,
                    total_amount, deposit_id, deposit_amount, deposit_net, currency, status, guests)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'confirmed', $12)`,
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'pending', $14)`,
                 [
                   reservationNo,
                   ctx.guestId,
                   roomTypeId,
+                  ctx.roomId,
+                  ctx.roomNumber,
                   ctx.holdId,
                   checkIn,
                   checkOut,
@@ -466,6 +444,7 @@ export function createApp({
                 reason: 'initial',
                 actor,
               });
+              await replaceAdditionalGuests(client, reservationNo, additionalGuests);
               await client.query('COMMIT');
             } catch (error) {
               await client.query('ROLLBACK').catch(() => {});
@@ -483,31 +462,39 @@ export function createApp({
         },
         {
           async execute(ctx) {
-            await http.post(`${roomRateUrl()}/holds/${ctx.holdId}/confirm`);
-          },
-        },
-        {
-          async execute(ctx) {
-            await publishEvent(notificationPayload({
-              reservationNo,
-              guestId: ctx.guestId,
-              guestEmail: ctx.guestEmail,
-              guestPhone: ctx.guestPhone,
-              roomTypeId,
-              checkIn,
-              checkOut,
-              totalAmount: ctx.amount,
-              currency: ctx.currency,
-              channel: channel === "sms" ? "sms" : "email",
-            }));
+            await services.rooms.confirm(ctx.holdId, "The room hold expired before the booking completed. Please try again.");
           },
         },
       ]);
+
+      // The booking is committed; a broker outage must not undo it.
+      try {
+        await publishEvent(notificationPayload({
+          reservationNo,
+          guestId: result.guestId,
+          guestName: result.guestName,
+          guestEmail: result.guestEmail,
+          guestPhone: result.guestPhone,
+          roomTypeId,
+          roomNumber: result.roomNumber,
+          checkIn,
+          checkOut,
+          guests,
+          totalAmount: result.amount,
+          depositAmount: result.depositAmount,
+          currency: result.currency,
+          channel: channel === "sms" ? "sms" : "email",
+        }, { event: "ReservationCreated" }));
+      } catch (error) {
+        console.error(`Failed to publish ReservationConfirmed for ${reservationNo}:`, error);
+      }
 
       return res.status(201).json({
         reservationNo,
         guestId: result.guestId,
         roomTypeId,
+        roomId: result.roomId,
+        roomNumber: result.roomNumber,
         checkIn,
         checkOut,
         totalAmount: result.amount,
@@ -515,7 +502,8 @@ export function createApp({
         depositHeld: result.depositAmount,
         currency: result.currency,
         guests,
-        status: "confirmed",
+        additionalGuests,
+        status: "pending",
       });
     } catch (error) {
       if (error instanceof HttpError) {
@@ -528,8 +516,7 @@ export function createApp({
 
   app.get("/reservations", async (req, res, next) => {
     const { guestId, status, from, to } = req.query;
-    const isDate = (value) =>
-      value == null || value === "" || /^\d{4}-\d{2}-\d{2}$/.test(value);
+    const isDate = (value) => value == null || value === "" || validDate(value);
 
     if (!isDate(from) || !isDate(to)) {
       return fail(
@@ -557,16 +544,32 @@ export function createApp({
     }
   });
 
-  app.get("/reservations/:no", async (req, res, next) => {
+  // Booking counts per guest for the staff guest directory.
+  app.get("/reservations/guest-counts", async (_req, res, next) => {
     try {
       const result = await db.query(
-        `SELECT ${reservationSelect} FROM reservations WHERE reservation_no = $1`,
-        [req.params.no],
+        `SELECT guest_id AS "guestId",
+                COUNT(*)::int AS total,
+                COUNT(*) FILTER (WHERE status IN ('pending', 'confirmed') AND checked_out_at IS NULL)::int AS active,
+                COUNT(*) FILTER (WHERE checked_out_at IS NOT NULL)::int AS completed,
+                COUNT(*) FILTER (WHERE status = 'cancelled')::int AS cancelled
+         FROM reservations
+         GROUP BY guest_id`,
       );
+      return res.status(200).json({ counts: result.rows });
+    } catch (error) {
+      return next(error);
+    }
+  });
 
-      if (!result.rowCount)
-        return fail(res, 404, "NotFound", "Reservation not found.");
-      return res.status(200).json(result.rows[0]);
+  app.get("/reservations/:no", async (req, res, next) => {
+    try {
+      const reservation = await loadReservation(db, req.params.no);
+      if (!reservation) return fail(res, 404, "NotFound", "Reservation not found.");
+      return res.status(200).json({
+        ...reservation,
+        additionalGuests: await loadAdditionalGuests(db, req.params.no, actorFromRequest(req).role),
+      });
     } catch (error) {
       return next(error);
     }
@@ -580,7 +583,7 @@ export function createApp({
       }
 
       const heldAmount = depositHeldValue(reservation);
-      const now = new Date();
+      const now = clock();
       const checkIn = new Date(`${reservation.checkIn}T00:00:00Z`);
       const hoursBeforeCheckIn = Math.max(0, Math.round((checkIn.getTime() - now.getTime()) / 3_600_000));
       const percent = cancellationPolicy.refundPercent(reservation.checkIn, now);
@@ -605,14 +608,20 @@ export function createApp({
         return fail(res, 404, "NotFound", "Reservation not found.");
       }
 
-      const approvedProofsTotal = await loadApprovedProofsTotal(http, req.params.no);
+      const approvedProofsTotal = await services.billing.approvedTotal(req.params.no);
       const heldAmount = depositHeldValue(reservation);
-      const balanceDue = Math.max(0, Math.round((Number(reservation.totalAmount) - heldAmount - approvedProofsTotal) * 100) / 100);
+      const amountOwed = reservation.status === "cancelled"
+        ? Number(reservation.cancellationFee ?? heldAmount)
+        : Number(reservation.totalAmount);
+      const settledAtDesk = await settledTotal(db, req.params.no);
+      const balanceDue = Math.max(0, roundMoney(amountOwed - heldAmount - approvedProofsTotal - settledAtDesk));
 
       return res.status(200).json({
+        status: reservation.status,
+        settledAtDesk,
         totalAmount: Number(reservation.totalAmount),
         depositHeld: heldAmount,
-        approvedProofsTotal: Math.round(approvedProofsTotal * 100) / 100,
+        approvedProofsTotal: roundMoney(approvedProofsTotal),
         balanceDue,
         currency: currencyValue(reservation),
       });
@@ -636,35 +645,75 @@ export function createApp({
     }
 
     try {
-      const found = await db.query(
-        "SELECT * FROM reservations WHERE reservation_no = $1",
-        [req.params.no],
-      );
-      if (!found.rowCount)
-        return fail(res, 404, "NotFound", "Reservation not found.");
+      const current = await loadRawReservation(db, req.params.no);
+      if (!current) return fail(res, 404, "NotFound", "Reservation not found.");
 
-      const current = found.rows[0];
-      if (current.status !== "confirmed") {
-        return fail(
-          res,
-          409,
-          "Conflict",
-          "Only confirmed reservations can be modified.",
-        );
+      const denied = stateOf(current).modify(ruleContext(current, actor.role));
+      if (denied) return fail(res, ...denied);
+      if (checkIn !== current.checkInDate && checkIn < today()) {
+        return fail(res, 400, "BadRequest", "Check-in cannot be moved into the past.");
+      }
+      if (checkOut <= today()) {
+        return fail(res, 400, "BadRequest", "Check-out must be after today.");
+      }
+
+      const nextGuests = guests ?? current.guests;
+      const providedGuests = parseAdditionalGuests(req.body?.additionalGuests);
+      const partySize = nextGuests ?? 1;
+      const partyChanged = guests != null && guests !== (current.guests ?? 1);
+      if (
+        providedGuests?.error ||
+        (providedGuests && providedGuests.length !== partySize - 1) ||
+        (!providedGuests && partyChanged && partySize > 1)
+      ) {
+        return fail(res, 400, "BadRequest", guestDetailsError(partySize));
+      }
+      const nextAdditionalGuests = providedGuests ?? (partyChanged ? [] : null);
+
+      const contact = () => loadGuestContact(current.guest_id);
+      const unchanged =
+        roomTypeId === current.room_type_id &&
+        checkIn === current.checkInDate &&
+        checkOut === current.checkOutDate &&
+        (guests == null || guests === current.guests);
+      if (unchanged) {
+        if (nextAdditionalGuests) {
+          const client = await db.connect();
+          try {
+            await client.query("BEGIN");
+            await replaceAdditionalGuests(client, req.params.no, nextAdditionalGuests);
+            await client.query("COMMIT");
+          } catch (error) {
+            await client.query("ROLLBACK").catch(() => {});
+            throw error;
+          } finally {
+            client.release();
+          }
+          const updated = await loadReservation(db, req.params.no);
+          await publishNotification('ReservationModified', notificationPayload({
+            ...updated,
+            ...(await contact()),
+          }, { event: 'ReservationModified' }));
+        }
+        return res.status(200).json({
+          ...(await loadReservation(db, req.params.no)),
+          additionalGuests: await loadAdditionalGuests(db, req.params.no, actor.role),
+        });
       }
 
       const currentHeld = depositHeldValue(current);
+      const currency = currencyValue(current);
 
       const result = await runSaga([
         {
           async execute() {
-            const availability = await findAvailability(
+            const availability = await services.rooms.availability({
               checkIn,
               checkOut,
               roomTypeId,
-              guests ?? current.guests,
-              current.hold_id,
-            );
+              guests: nextGuests,
+              excludeHoldId: current.hold_id,
+            });
             if (!availability?.available || availability.roomsAvailable < 1) {
               throw new HttpError(
                 409,
@@ -673,53 +722,52 @@ export function createApp({
               );
             }
             const amount = totalPrice(availability.nightlyRate, checkIn, checkOut);
+            const depositAmount = depositPrice(amount);
             return {
               amount,
-              delta: Math.round((amount - currentHeld) * 100) / 100,
+              depositAmount,
+              delta: roundMoney(depositAmount - currentHeld),
             };
           },
         },
         {
           async execute() {
-            const holdResult = await http.post(`${roomRateUrl()}/holds`, {
-              roomTypeId,
-              checkIn,
-              checkOut,
-              excludeHoldId: current.hold_id,
-            });
-            return { newHoldId: holdResult.data.id };
+            const held = await services.rooms.hold({ roomTypeId, checkIn, checkOut, excludeHoldId: current.hold_id });
+            return { newHoldId: held.holdId, roomId: held.roomId, roomNumber: held.roomNumber };
           },
           async compensate(ctx) {
-            await releaseHold(ctx.newHoldId);
+            await services.rooms.release(ctx.newHoldId);
           },
         },
         {
           async execute(ctx) {
-            await http.post(`${roomRateUrl()}/holds/${ctx.newHoldId}/confirm`);
+            await services.rooms.confirm(ctx.newHoldId, "The room hold expired before the change completed. Please try again.");
+          },
+        },
+        {
+          // The deposit always stays at DEPOSIT_PERCENT of the new total.
+          async execute(ctx) {
             if (ctx.delta > 0) {
-              const topUpPaymentId = await authorizeTopUp({
-                http,
+              const topUpPaymentId = await services.billing.authorize({
                 reservationNo: req.params.no,
                 guestId: current.guest_id,
                 amount: ctx.delta,
-                currency: current.currency,
+                currency,
               });
               return { topUpPaymentId };
             }
 
             if (ctx.delta < 0) {
               const sources = await loadPaymentSources(db, current);
-              const refunds = await refundAcrossSources({
-                http,
-                reservationNo: req.params.no,
-                sources,
-                amount: Math.abs(ctx.delta),
-                currency: current.currency,
-              });
+              const refunds = await refundAcrossSources(sources, Math.abs(ctx.delta), currency);
               return { refunds };
             }
 
             return {};
+          },
+          async compensate(ctx) {
+            if (!ctx.topUpPaymentId) return;
+            await services.billing.refund({ depositId: ctx.topUpPaymentId, amount: ctx.delta, currency });
           },
         },
         {
@@ -727,13 +775,13 @@ export function createApp({
             const client = await db.connect();
             try {
               await client.query('BEGIN');
-              const newDepositHeld = Math.round((currentHeld + ctx.delta) * 100) / 100;
+              const newDepositHeld = roundMoney(currentHeld + ctx.delta);
               const updated = await client.query(
                 `UPDATE reservations
                  SET room_type_id = $2, hold_id = $3, check_in = $4,
                      check_out = $5, total_amount = $6, deposit_net = $7,
-                     guests = COALESCE($8, guests)
-                 WHERE reservation_no = $1
+                     guests = COALESCE($8, guests), room_id = $9, room_number = $10
+                 WHERE reservation_no = $1 AND status IN ('pending', 'confirmed') AND checked_in_at IS NULL
                  RETURNING ${reservationSelect}`,
                 [
                   req.params.no,
@@ -744,8 +792,13 @@ export function createApp({
                   ctx.amount,
                   newDepositHeld,
                   guests,
+                  ctx.roomId,
+                  ctx.roomNumber,
                 ],
               );
+              if (!updated.rowCount) {
+                throw new HttpError(409, "Conflict", "The reservation changed while it was being modified.");
+              }
 
               if (ctx.topUpPaymentId) {
                 await writeLedgerRow(client, {
@@ -753,61 +806,52 @@ export function createApp({
                   type: 'topup',
                   billingPaymentId: ctx.topUpPaymentId,
                   amount: ctx.delta,
-                  currency: current.currency,
+                  currency,
                   reason: 'modify_increase',
                   actor,
                 });
               }
 
-              if (ctx.refunds?.length) {
-                for (const refund of ctx.refunds) {
-                  await writeLedgerRow(client, {
-                    reservationNo: req.params.no,
-                    type: 'refund',
-                    billingPaymentId: refund.refundId,
-                    depositRef: refund.source.billingPaymentId,
-                    amount: refund.amount,
-                    currency: current.currency,
-                    reason: 'modify_decrease',
-                    actor,
-                  });
-                }
+              for (const refund of ctx.refunds ?? []) {
+                await writeLedgerRow(client, {
+                  reservationNo: req.params.no,
+                  type: 'refund',
+                  billingPaymentId: refund.refundId,
+                  depositRef: refund.source.billingPaymentId,
+                  amount: refund.amount,
+                  currency,
+                  reason: 'modify_decrease',
+                  actor,
+                });
+              }
+
+              if (nextAdditionalGuests) {
+                await replaceAdditionalGuests(client, req.params.no, nextAdditionalGuests);
               }
 
               await client.query('COMMIT');
-              await publishNotification('ReservationModified', notificationPayload({
-                reservationNo: req.params.no,
-                guestId: current.guest_id,
-                roomTypeId,
-                checkIn,
-                checkOut,
-                totalAmount: ctx.amount,
-                currency: current.currency,
-              }, { event: 'ReservationModified' }));
               return { updated: updated.rows[0] };
             } catch (error) {
               await client.query('ROLLBACK').catch(() => {});
-              if (ctx.topUpPaymentId) {
-                await http.post(`${billingUrl()}/refunds`, {
-                  depositId: ctx.topUpPaymentId,
-                  amount: ctx.delta,
-                  currency: current.currency,
-                }).catch(() => {});
-              }
               throw error;
             } finally {
               client.release();
             }
           },
         },
-        {
-          async execute() {
-            await releaseHold(current.hold_id);
-          },
-        },
       ]);
 
-      return res.status(200).json(result.updated);
+      await releaseHoldBestEffort(current.hold_id);
+
+      await publishNotification('ReservationModified', notificationPayload({
+        ...result.updated,
+        ...(await contact()),
+      }, { event: 'ReservationModified' }));
+
+      return res.status(200).json({
+        ...result.updated,
+        additionalGuests: await loadAdditionalGuests(db, req.params.no, actor.role),
+      });
     } catch (error) {
       if (error instanceof HttpError) {
         return fail(res, error.status, error.error, error.message);
@@ -819,54 +863,57 @@ export function createApp({
 
   app.delete("/reservations/:no", async (req, res, next) => {
     try {
-      const found = await db.query(
-        "SELECT * FROM reservations WHERE reservation_no = $1",
-        [req.params.no],
-      );
-      if (!found.rowCount)
-        return fail(res, 404, "NotFound", "Reservation not found.");
-
-      const reservation = found.rows[0];
-      if (reservation.status !== "confirmed") {
-        return fail(res, 409, "Conflict", "Reservation is already cancelled.");
-      }
+      const reservation = await loadRawReservation(db, req.params.no);
+      if (!reservation) return fail(res, 404, "NotFound", "Reservation not found.");
 
       const actor = actorFromRequest(req);
+      const state = stateOf(reservation);
+      if (state.name === "cancelled") {
+        // A previous cancellation may have failed half-way; retry the follow-up steps.
+        await releaseHoldBestEffort(reservation.hold_id);
+        await cancelProofsBestEffort(req.params.no);
+      }
+      const denied = state.cancel(ruleContext(reservation, actor.role));
+      if (denied) return fail(res, ...denied);
       const waiveFee = req.body?.waiveFee === true || req.body?.waiveFee === 'true';
       if (waiveFee && actor.role !== 'manager') {
         return fail(res, 403, "Forbidden", "Only managers can waive cancellation fees.");
       }
 
+      const currency = currencyValue(reservation);
       const heldAmount = depositHeldValue(reservation);
       const percent = waiveFee ? 100 : cancellationPolicy.refundPercent(
-        reservation.check_in,
-        new Date(),
+        reservation.checkInDate,
+        clock(),
       );
       const refundAmount = Math.round((heldAmount * percent) * 100) / 10000;
-      const feeAmount = Math.round((heldAmount - refundAmount) * 100) / 100;
-      const sources = refundAmount > 0 ? await loadPaymentSources(db, reservation) : [];
-      const refunds = refundAmount > 0
-        ? await refundAcrossSources({
-            http,
-            reservationNo: req.params.no,
-            sources,
-            amount: refundAmount,
-            currency: currencyValue(reservation),
-          })
-        : [];
+      const feeAmount = roundMoney(heldAmount - refundAmount);
+
+      // Claim the reservation first so two concurrent cancellations cannot both refund.
+      const memento = await saveMemento(db, req.params.no);
+      const claimed = await db.query(
+        `UPDATE reservations
+         SET status = 'cancelled', cancelled_at = NOW(),
+             refund_amount = $2, cancellation_fee = $3, deposit_net = $3
+         WHERE reservation_no = $1 AND status IN ('pending', 'confirmed') AND checked_in_at IS NULL`,
+        [req.params.no, refundAmount, feeAmount],
+      );
+      if (!claimed.rowCount) {
+        return fail(res, 409, "Conflict", "Reservation is already cancelled.");
+      }
+
+      let refunds;
+      try {
+        const sources = refundAmount > 0 ? await loadPaymentSources(db, reservation) : [];
+        refunds = refundAmount > 0 ? await refundAcrossSources(sources, refundAmount, currency) : [];
+      } catch (error) {
+        await restoreMemento(db, memento);
+        throw error;
+      }
 
       const client = await db.connect();
       try {
         await client.query('BEGIN');
-        await client.query(
-          `UPDATE reservations
-           SET status = 'cancelled', cancelled_at = NOW(),
-               refund_amount = $2, cancellation_fee = $3,
-               deposit_net = $4
-           WHERE reservation_no = $1`,
-          [req.params.no, refundAmount, feeAmount, feeAmount],
-        );
-
         for (const refund of refunds) {
           await writeLedgerRow(client, {
             reservationNo: req.params.no,
@@ -874,22 +921,12 @@ export function createApp({
             billingPaymentId: refund.refundId,
             depositRef: refund.source.billingPaymentId,
             amount: refund.amount,
-            currency: currencyValue(reservation),
+            currency,
             reason: waiveFee ? 'waived_fee' : 'policy',
             actor,
           });
         }
-
         await client.query('COMMIT');
-        await publishNotification('ReservationCancelled', notificationPayload({
-          reservationNo: req.params.no,
-          guestId: reservation.guest_id,
-          roomTypeId: reservation.room_type_id,
-          checkIn: reservation.check_in,
-          checkOut: reservation.check_out,
-          totalAmount: reservation.total_amount,
-          currency: reservation.currency,
-        }, { event: 'ReservationCancelled' }));
       } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
         throw error;
@@ -897,10 +934,185 @@ export function createApp({
         client.release();
       }
 
-      await releaseHold(reservation.hold_id);
+      await releaseHoldBestEffort(reservation.hold_id);
+      const payments = await cancelProofsBestEffort(req.params.no);
+
+      const contact = await loadGuestContact(reservation.guest_id);
+      await publishNotification('ReservationCancelled', notificationPayload({
+        reservationNo: req.params.no,
+        guestId: reservation.guest_id,
+        ...contact,
+        roomTypeId: reservation.room_type_id,
+        roomNumber: reservation.room_number,
+        checkIn: reservation.checkInDate,
+        checkOut: reservation.checkOutDate,
+        totalAmount: reservation.total_amount,
+        currency,
+      }, {
+        event: 'ReservationCancelled',
+        refundAmount,
+        cancellationFee: feeAmount,
+        cancelledProofs: payments?.cancelledProofs ?? [],
+        proofRefundDue: payments?.refundDueTotal ?? 0,
+      }));
+
       return res.status(204).end();
     } catch (error) {
       console.error(error);
+      return next(error);
+    }
+  });
+
+  // Internal: billing calls this when staff approve a payment for the booking.
+  app.post("/reservations/:no/payment-approved", async (req, res, next) => {
+    try {
+      const current = await loadReservation(db, req.params.no);
+      if (!current) return fail(res, 404, "NotFound", "Reservation not found.");
+      const transition = stateOf(current).approvePayment();
+      if (transition.error) return fail(res, ...transition.error);
+
+      const updated = await db.query(
+        `UPDATE reservations SET status = 'confirmed', confirmed_at = $2
+         WHERE reservation_no = $1 AND status = 'pending'
+         RETURNING ${reservationSelect}`,
+        [req.params.no, clock().toISOString()],
+      );
+      return res.status(200).json(updated.rows[0] ?? (await loadReservation(db, req.params.no)));
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  app.post("/reservations/:no/check-in", async (req, res, next) => {
+    const actor = actorFromRequest(req);
+    if (!isStaff(actor.role)) {
+      return fail(res, 403, "Forbidden", "Only the front desk or a manager can check guests in.");
+    }
+    try {
+      const reservation = await loadReservation(db, req.params.no);
+      if (!reservation) return fail(res, 404, "NotFound", "Reservation not found.");
+      const denied = stateOf(reservation).checkIn(ruleContext(reservation, actor.role));
+      if (denied) return fail(res, ...denied);
+
+      const updated = await db.query(
+        `UPDATE reservations SET checked_in_at = $2, checked_in_by = $3
+         WHERE reservation_no = $1 AND status = 'confirmed' AND checked_in_at IS NULL
+         RETURNING ${reservationSelect}`,
+        [req.params.no, clock().toISOString(), actor.id],
+      );
+      if (!updated.rowCount) return fail(res, 409, "Conflict", "The guest has already checked in.");
+      await publishNotification('ReservationModified', notificationPayload({
+        ...updated.rows[0],
+        ...(await loadGuestContact(updated.rows[0].guestId)),
+      }, { event: 'ReservationCheckedIn' }));
+      return res.status(200).json(updated.rows[0]);
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  // Check-out settles the bill: the deposit is applied, approved payments are
+  // counted, any balance left must be collected at the desk, and later nights
+  // are released for new bookings.
+  app.post("/reservations/:no/check-out", async (req, res, next) => {
+    const actor = actorFromRequest(req);
+    if (!isStaff(actor.role)) {
+      return fail(res, 403, "Forbidden", "Only the front desk or a manager can check guests out.");
+    }
+    try {
+      const reservation = await loadRawReservation(db, req.params.no);
+      if (!reservation) return fail(res, 404, "NotFound", "Reservation not found.");
+      const denied = stateOf(reservation).checkOut(ruleContext(reservation, actor.role));
+      if (denied) return fail(res, ...denied);
+
+      const currency = currencyValue(reservation);
+      const total = Number(reservation.total_amount);
+      const depositApplied = depositHeldValue(reservation);
+      const approvedPayments = roundMoney(await services.billing.approvedTotal(req.params.no));
+      const settledBefore = await settledTotal(db, req.params.no);
+      const balance = Math.max(0, roundMoney(total - depositApplied - approvedPayments - settledBefore));
+      if (balance > 0 && req.body?.collectBalance !== true) {
+        return res.status(409).json({
+          error: "BalanceDue",
+          message: `The guest still owes ${balance.toFixed(2)} ${currency}. Collect it at the desk, then check out.`,
+          balanceDue: balance,
+          currency,
+        });
+      }
+
+      const memento = await saveMemento(db, req.params.no);
+      const claimed = await db.query(
+        `UPDATE reservations SET checked_out_at = GREATEST($2::timestamptz, checked_in_at), checked_out_by = $3
+         WHERE reservation_no = $1 AND checked_in_at IS NOT NULL AND checked_out_at IS NULL`,
+        [req.params.no, clock().toISOString(), actor.id],
+      );
+      if (!claimed.rowCount) return fail(res, 409, "Conflict", "The guest has already checked out.");
+
+      let settlement = null;
+      try {
+        await services.billing.captureDeposits(req.params.no);
+        if (balance > 0) {
+          settlement = await services.billing.settle({
+            reservationNo: req.params.no,
+            guestId: reservation.guest_id,
+            amount: balance,
+            currency,
+          });
+        }
+        const client = await db.connect();
+        try {
+          await client.query("BEGIN");
+          if (settlement) {
+            await writeLedgerRow(client, {
+              reservationNo: req.params.no,
+              type: "settlement",
+              billingPaymentId: settlement.id,
+              amount: balance,
+              currency,
+              reason: "checkout_balance",
+              actor,
+            });
+          }
+          await client.query(
+            "UPDATE reservations SET balance_collected = $2 WHERE reservation_no = $1",
+            [req.params.no, balance],
+          );
+          await client.query("COMMIT");
+        } catch (error) {
+          await client.query("ROLLBACK").catch(() => {});
+          throw error;
+        } finally {
+          client.release();
+        }
+      } catch (error) {
+        await restoreMemento(db, memento);
+        throw error;
+      }
+
+      // Free the nights after an early departure; a failure here must not undo the check-out.
+      try {
+        await services.rooms.complete(reservation.hold_id, today());
+      } catch (error) {
+        console.error(`Failed to release remaining nights for ${req.params.no}:`, error.message);
+      }
+
+      const statement = {
+        totalAmount: total,
+        depositApplied,
+        approvedPayments,
+        collectedAtDesk: roundMoney(settledBefore + balance),
+        settlementPaymentNo: settlement?.paymentNo ?? null,
+        balanceDue: 0,
+        currency,
+      };
+      const updated = await loadReservation(db, req.params.no);
+      await publishNotification('ReservationModified', notificationPayload({
+        ...updated,
+        ...(await loadGuestContact(reservation.guest_id)),
+      }, { event: 'ReservationCheckedOut', statement }));
+
+      return res.status(200).json({ ...updated, statement });
+    } catch (error) {
       return next(error);
     }
   });

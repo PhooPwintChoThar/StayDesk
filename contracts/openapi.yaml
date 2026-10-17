@@ -79,37 +79,14 @@ paths:
         "400":
           $ref: "#/components/responses/BadRequest"
 
-  /hotels:
-    get:
-      operationId: listHotels
-      tags: [room-rate]
-      responses:
-        "200":
-          description: Available hotels
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [hotels]
-                properties:
-                  hotels:
-                    type: array
-                    items:
-                      type: object
-                      required: [id, name]
-                      properties:
-                        id:
-                          type: string
-                        name:
-                          type: string
-
   /room-types:
     get:
       operationId: listRoomTypes
       tags: [room-rate]
+      description: Public. Room types with their current nightly rate and number of rooms.
       responses:
         "200":
-          description: Room types available for reservation searches
+          description: Room types of the hotel
           content:
             application/json:
               schema:
@@ -119,15 +96,216 @@ paths:
                   roomTypes:
                     type: array
                     items:
-                      type: object
-                      required: [id, name, maxOccupancy]
-                      properties:
-                        id:
-                          type: string
-                        name:
-                          type: string
-                        maxOccupancy:
-                          type: integer
+                      $ref: "#/components/schemas/RoomType"
+    post:
+      operationId: createRoomType
+      tags: [room-rate]
+      description: Manager only. Creates a room type and its nightly rate.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RoomTypeInput"
+      responses:
+        "201":
+          description: Created room type
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RoomType"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /room-types/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    patch:
+      operationId: updateRoomType
+      tags: [room-rate]
+      description: Manager only. Price changes apply to new bookings only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                description:
+                  type: string
+                maxOccupancy:
+                  type: integer
+                  minimum: 1
+                nightlyRate:
+                  type: number
+      responses:
+        "200":
+          description: Updated room type
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RoomType"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      operationId: deleteRoomType
+      tags: [room-rate]
+      description: Manager only. Refused (409) while rooms or bookings use the type.
+      responses:
+        "200":
+          description: Deleted
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /rooms:
+    get:
+      operationId: listRooms
+      tags: [room-rate]
+      description: Agents and managers. Maintenance windows that have ended are cleared on read.
+      responses:
+        "200":
+          description: All rooms
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [rooms]
+                properties:
+                  rooms:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Room"
+    post:
+      operationId: createRoom
+      tags: [room-rate]
+      description: Manager only. Pass either an existing roomTypeId or a newRoomType to create both in one transaction.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [roomNumber]
+              properties:
+                roomNumber:
+                  type: string
+                roomTypeId:
+                  type: string
+                newRoomType:
+                  $ref: "#/components/schemas/RoomTypeInput"
+      responses:
+        "201":
+          description: Created room
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Room"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /rooms/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    patch:
+      operationId: updateRoom
+      tags: [room-rate]
+      description: Manager only. Changing the room type is refused while the room has upcoming reservations.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                roomNumber:
+                  type: string
+                roomTypeId:
+                  type: string
+      responses:
+        "200":
+          description: Updated room
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Room"
+        "409":
+          $ref: "#/components/responses/Conflict"
+    delete:
+      operationId: deleteRoom
+      tags: [room-rate]
+      description: Manager only. Refused while the room has upcoming reservations.
+      responses:
+        "200":
+          description: Deleted
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /rooms/{id}/maintenance:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    put:
+      operationId: setRoomMaintenance
+      tags: [room-rate]
+      description: >
+        Manager only. Puts the room out of service from `from` (inclusive) until `to`
+        (the day it is back in service). Refused with 409 when any held or confirmed
+        reservation on this room overlaps the period, or 400 when `from` is in the past.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [from, to]
+              properties:
+                from:
+                  type: string
+                  format: date
+                to:
+                  type: string
+                  format: date
+                note:
+                  type: string
+      responses:
+        "200":
+          description: Room under maintenance
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Room"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+    delete:
+      operationId: endRoomMaintenance
+      tags: [room-rate]
+      description: Manager only. Returns the room to available.
+      responses:
+        "200":
+          description: Room available
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Room"
 
   /availability:
     get:
@@ -147,10 +325,6 @@ paths:
             type: string
             format: date
         - name: roomTypeId
-          in: query
-          schema:
-            type: string
-        - name: hotelId
           in: query
           schema:
             type: string
@@ -180,6 +354,7 @@ paths:
         "400":
           $ref: "#/components/responses/BadRequest"
 
+  # Internal only: holds, deposits, refunds and /payments/reservations/* are not routed by the gateway.
   /holds:
     post:
       operationId: createRoomHold
@@ -782,6 +957,81 @@ components:
         type: string
 
   schemas:
+    RoomTypeInput:
+      type: object
+      required: [name, maxOccupancy, nightlyRate]
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        maxOccupancy:
+          type: integer
+          minimum: 1
+          maximum: 20
+        nightlyRate:
+          type: number
+          exclusiveMinimum: 0
+        currency:
+          type: string
+          description: Defaults to the hotel currency (USD).
+    RoomType:
+      type: object
+      required: [id, name, maxOccupancy, roomCount]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+          nullable: true
+        maxOccupancy:
+          type: integer
+        nightlyRate:
+          type: number
+          nullable: true
+        currency:
+          type: string
+          nullable: true
+        roomCount:
+          type: integer
+    Room:
+      type: object
+      required: [id, roomNumber, status, roomTypeId]
+      properties:
+        id:
+          type: string
+        roomNumber:
+          type: string
+        status:
+          type: string
+          enum: [available, maintenance]
+        maintenanceFrom:
+          type: string
+          format: date
+          nullable: true
+        maintenanceTo:
+          type: string
+          format: date
+          nullable: true
+        maintenanceNote:
+          type: string
+          nullable: true
+        roomTypeId:
+          type: string
+        roomTypeName:
+          type: string
+        maxOccupancy:
+          type: integer
+        nightlyRate:
+          type: number
+          nullable: true
+        currency:
+          type: string
+          nullable: true
+        upcomingReservations:
+          type: integer
     Availability:
       type: object
       required: [roomTypeId, available, nightlyRate, currency]

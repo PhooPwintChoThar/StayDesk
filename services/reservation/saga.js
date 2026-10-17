@@ -1,4 +1,7 @@
 // Template Method + Command: run booking steps in order and compensate in reverse (NFR-5).
+// Mediator: the Reservation Service is the saga orchestrator. Room-Rate, Guest
+// and Billing never call each other; all coordination goes through here, so each
+// of them stays independent of the others (NFR-7).
 
 export class HttpError extends Error {
   constructor(status, error, message) {

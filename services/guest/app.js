@@ -33,6 +33,8 @@ function guestRowValues(guest) {
   ];
 }
 
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 function errorResponse(res, status, error, message) {
   return res.status(status).json({ error, message });
 }
@@ -80,7 +82,23 @@ function maskDocument(value) {
   return `${'*'.repeat(trimmed.length - 4)}${trimmed.slice(-4)}`;
 }
 
-export function createApp({ db = pool } = {}) {
+function localDate(now) {
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+}
+
+// Asks the reservation service whether the guest has a current or upcoming confirmed stay.
+async function guestHasActiveReservations(guestId) {
+  const base = (process.env.RESERVATION_SERVICE_URL || 'http://reservation:3000').replace(/\/$/, '');
+  const query = new URLSearchParams({ guestId, status: 'confirmed', from: localDate(new Date()) });
+  const response = await fetch(`${base}/reservations?${query}`, {
+    headers: process.env.INTERNAL_TOKEN ? { 'x-internal-token': process.env.INTERNAL_TOKEN } : {}
+  });
+  if (!response.ok) throw new Error(`Reservation lookup failed (${response.status})`);
+  const data = await response.json();
+  return (data.reservations ?? []).length > 0;
+}
+
+export function createApp({ db = pool, hasActiveReservations = guestHasActiveReservations } = {}) {
   const app = express();
   app.use(express.json());
   app.use(internalTokenGuard);
@@ -224,8 +242,18 @@ export function createApp({ db = pool } = {}) {
       );
 
       if (found.rowCount) {
+        // Keep the stored profile, but fill details the guest has given for the first time.
+        const filled = await client.query(
+          `UPDATE guests
+           SET id_document = COALESCE(NULLIF(id_document, ''), $2),
+               address = COALESCE(NULLIF(address, ''), $3),
+               updated_at = NOW()
+           WHERE id = $1
+           RETURNING ${guestFields}`,
+          [found.rows[0].id, guest.idDocument, guest.address]
+        );
         await client.query('COMMIT');
-        return res.status(200).json(serializeGuest(found.rows[0], actor));
+        return res.status(200).json(serializeGuest(filled.rows[0], actor));
       }
 
       const created = await client.query(
@@ -278,18 +306,43 @@ export function createApp({ db = pool } = {}) {
   });
 
   app.get('/guests', async (req, res, next) => {
-    const ids = typeof req.query.ids === 'string' ? req.query.ids.split(',').map((item) => item.trim()).filter(Boolean) : [];
-    if (!ids.length) {
-      return errorResponse(res, 400, 'BadRequest', 'A non-empty ids query parameter is required.');
+    // With ids: brief name lookups. Without: the full guest directory for staff.
+    if (typeof req.query.ids === 'string') {
+      const ids = req.query.ids.split(',').map((item) => item.trim()).filter((item) => UUID_PATTERN.test(item));
+      if (!ids.length) {
+        return errorResponse(res, 400, 'BadRequest', 'A non-empty ids query parameter is required.');
+      }
+      try {
+        const result = await db.query(
+          `SELECT id, first_name AS "firstName", last_name AS "lastName", email, phone
+           FROM guests WHERE id = ANY($1::uuid[]) ORDER BY last_name, first_name, id`,
+          [ids]
+        );
+        return res.status(200).json({ guests: result.rows });
+      } catch (error) {
+        return next(error);
+      }
     }
 
     try {
+      const actor = actorFromRequest(req);
+      const query = typeof req.query.q === 'string' ? req.query.q.trim() : '';
       const result = await db.query(
-        `SELECT id, first_name AS "firstName", last_name AS "lastName", email, phone
-         FROM guests WHERE id = ANY($1::uuid[]) ORDER BY last_name, first_name, id`,
-        [ids]
+        `SELECT ${guestFields},
+                created_at AS "createdAt",
+                (password_hash IS NOT NULL) AS "hasAccount"
+         FROM guests
+         WHERE $1 = ''
+            OR email ILIKE '%' || $1 || '%'
+            OR first_name ILIKE '%' || $1 || '%'
+            OR last_name ILIKE '%' || $1 || '%'
+            OR (first_name || ' ' || last_name) ILIKE '%' || $1 || '%'
+            OR COALESCE(phone, '') ILIKE '%' || $1 || '%'
+            OR COALESCE(loyalty_number, '') ILIKE '%' || $1 || '%'
+         ORDER BY last_name, first_name, id`,
+        [query]
       );
-      return res.status(200).json({ guests: result.rows });
+      return res.status(200).json({ guests: result.rows.map((row) => serializeGuest(row, actor)) });
     } catch (error) {
       return next(error);
     }
@@ -385,6 +438,21 @@ export function createApp({ db = pool } = {}) {
 
   app.delete('/guests/:id', async (req, res, next) => {
     try {
+      const existing = await db.query('SELECT id FROM guests WHERE id::text = $1', [req.params.id]);
+      if (!existing.rowCount) {
+        return errorResponse(res, 404, 'NotFound', 'Guest not found.');
+      }
+      let active;
+      try {
+        active = await hasActiveReservations(req.params.id);
+      } catch (error) {
+        console.error(error);
+        return errorResponse(res, 503, 'ServiceUnavailable', 'Could not check the guest\'s reservations. Please try again.');
+      }
+      if (active) {
+        return errorResponse(res, 409, 'Conflict', 'This guest has current or upcoming reservations. Cancel them before deleting the profile.');
+      }
+
       const result = await db.query(
         'DELETE FROM guests WHERE id = $1 RETURNING id',
         [req.params.id]

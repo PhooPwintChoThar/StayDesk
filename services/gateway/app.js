@@ -60,16 +60,24 @@ function loginAllowed(ip) {
   return true;
 }
 
+const internalHeaders = () =>
+  process.env.INTERNAL_TOKEN ? { 'x-internal-token': process.env.INTERNAL_TOKEN } : {};
+
 async function authGuest(http, email, password) {
-  const response = await http.post(`${process.env.GUEST_SERVICE_URL || 'http://guest:3000'}/auth/login`, {
-    email,
-    password,
-  });
+  const response = await http.post(
+    `${process.env.GUEST_SERVICE_URL || 'http://guest:3000'}/auth/login`,
+    { email, password },
+    { headers: internalHeaders() }
+  );
   return response.data;
 }
 
 async function registerGuest(http, body) {
-  const response = await http.post(`${process.env.GUEST_SERVICE_URL || 'http://guest:3000'}/auth/register`, body);
+  const response = await http.post(
+    `${process.env.GUEST_SERVICE_URL || 'http://guest:3000'}/auth/register`,
+    body,
+    { headers: internalHeaders() }
+  );
   return response.data;
 }
 

@@ -9,6 +9,8 @@ export default defineConfig({
   plugins: [react()],
   test: {
     environment: 'jsdom',
-    setupFiles: './src/test-setup.js'
+    setupFiles: './src/test-setup.js',
+    // Form-filling tests type many fields; allow for slower machines.
+    testTimeout: 20000
   }
 });

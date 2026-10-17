@@ -1,4 +1,4 @@
-import { createNotifier } from './channels.js';
+import { createNotifier, MissingRecipientError } from './channels.js';
 
 export const QUEUE_NAME = 'ReservationConfirmed';
 export const QUEUE_NAMES = [
@@ -7,6 +7,10 @@ export const QUEUE_NAMES = [
   'ReservationCancelled',
   'PaymentProofReviewed'
 ];
+
+const RETRY_DELAY_MS = 5000;
+
+export class InvalidPayloadError extends Error {}
 
 const required = [
   'reservationNo',
@@ -17,21 +21,21 @@ const required = [
   'confirmedAt'
 ];
 
+function adapterFor(payload, notifier) {
+  if (typeof notifier.notify === 'function') return notifier;
+  return createNotifier({
+    mailer: notifier,
+    sms: notifier,
+    channel: payload.notificationChannel || payload.channel || process.env.NOTIFICATION_CHANNEL || 'email'
+  });
+}
+
 export async function handleReservationConfirmed(payload, notifier) {
   if (!payload || required.some((field) => !payload[field])) {
-    throw new Error('Invalid ReservationConfirmed payload.');
+    throw new InvalidPayloadError('Invalid ReservationConfirmed payload.');
   }
 
-  const channel = payload.notificationChannel || payload.channel || process.env.NOTIFICATION_CHANNEL || 'email';
-  const adapter = typeof notifier.notify === 'function'
-    ? notifier
-    : createNotifier({
-      mailer: notifier,
-      sms: notifier,
-      channel
-    });
-
-  await adapter.notify(payload);
+  return adapterFor(payload, notifier).notify(payload);
 }
 
 export async function handlePaymentProofReviewed(payload, notifier) {
@@ -45,19 +49,10 @@ export async function handlePaymentProofReviewed(payload, notifier) {
     !/^[A-Z]{3}$/.test(payload.currency) ||
     !['approved', 'rejected'].includes(payload.status)
   ) {
-    throw new Error('Invalid PaymentProofReviewed payload.');
+    throw new InvalidPayloadError('Invalid PaymentProofReviewed payload.');
   }
 
-  const channel = payload.notificationChannel || payload.channel || process.env.NOTIFICATION_CHANNEL || 'email';
-  const adapter = typeof notifier.notify === 'function'
-    ? notifier
-    : createNotifier({
-      mailer: notifier,
-      sms: notifier,
-      channel
-    });
-
-  await adapter.notify(payload);
+  return adapterFor(payload, notifier).notify(payload);
 }
 
 export async function handleNotification(payload, notifier) {
@@ -67,18 +62,41 @@ export async function handleNotification(payload, notifier) {
   return handleReservationConfirmed(payload, notifier);
 }
 
-export async function startConsumer(channel, notifier, queueName = QUEUE_NAME) {
+export async function startConsumer(
+  channel,
+  notifier,
+  queueName = QUEUE_NAME,
+  { record = async () => {}, enrich = async (payload) => payload, retryDelayMs = RETRY_DELAY_MS } = {}
+) {
   await channel.assertQueue(queueName, { durable: true });
   await channel.consume(queueName, async (message) => {
     if (!message) return;
 
+    let payload = null;
     try {
-      const payload = JSON.parse(message.content.toString());
-      await handleNotification(payload, notifier);
+      payload = JSON.parse(message.content.toString());
+      payload = await enrich(payload);
+      const delivery = await handleNotification(payload, notifier);
+      await record({ queueName, payload, status: 'sent', ...delivery }).catch((error) => console.error(error));
       channel.ack(message);
     } catch (error) {
-      console.error(`Failed to process ${queueName}:`, error);
-      channel.nack(message, false, true);
+      const permanent = error instanceof SyntaxError ||
+        error instanceof InvalidPayloadError ||
+        error instanceof MissingRecipientError;
+      console.error(`Failed to process ${queueName}:`, error.message);
+      await record({
+        queueName,
+        payload,
+        status: permanent ? 'skipped' : 'failed',
+        error: error.message
+      }).catch((recordError) => console.error(recordError));
+
+      if (permanent) {
+        // A malformed or undeliverable message will never succeed; drop it instead of looping.
+        channel.nack(message, false, false);
+      } else {
+        setTimeout(() => channel.nack(message, false, true), retryDelayMs);
+      }
     }
   });
 }

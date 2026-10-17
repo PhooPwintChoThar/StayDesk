@@ -97,6 +97,8 @@ describe("reservations management", () => {
     expect(within(table).getByText("3")).toBeInTheDocument();
     expect(screen.queryByText("Tony Stark")).not.toBeInTheDocument();
     expect(screen.getByText("Showing 1 of 1 entries")).toBeInTheDocument();
+    expect(screen.queryByText("Look up a reservation")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Find reservation" })).not.toBeInTheDocument();
   });
 
   it("passes the status filter to the API", async () => {
@@ -153,12 +155,13 @@ describe("reservations management", () => {
       screen.getByRole("button", { name: "Search availability" }),
     );
     await userEvent.click(
-      await screen.findByRole("button", { name: "Select" }),
+      await screen.findByRole("button", { name: /^Select/ }),
     );
 
     await userEvent.type(screen.getByLabelText("Email"), "guest@example.com");
     await userEvent.type(screen.getByLabelText("First name"), "Test");
     await userEvent.type(screen.getByLabelText("Last name"), "Guest");
+    await userEvent.type(screen.getByLabelText("Passport or ID number"), "P1234567");
     await userEvent.click(screen.getByRole("button", { name: "Book room" }));
 
     const confirmation = await screen.findByRole("status");
@@ -246,7 +249,7 @@ describe("role switcher and guests page", () => {
 
     expect(await screen.findByText("My bookings")).toBeInTheDocument();
     expect(await screen.findByText("R-STORED")).toBeInTheDocument();
-    expect(screen.queryByLabelText("Confirmation number")).not.toBeInTheDocument();
+    expect(screen.queryByText("Look up a reservation")).not.toBeInTheDocument();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     const logins = calls("POST", "/login").map(
       ([, options]) => JSON.parse(options.body).role,
@@ -254,42 +257,39 @@ describe("role switcher and guests page", () => {
     expect(logins).toEqual(["agent", "guest"]);
   });
 
-  it("searches guests and shows their stay history", async () => {
+  it("lists every guest with booking counts, their bookings, and booking details", async () => {
     mockApi({
-      "GET /reservations?guestId=guest-1": () =>
-        reply(200, { reservations: [stored] }),
-      "GET /reservations": () => reply(200, { reservations: [] }),
-      "GET /guests/search": () =>
+      "GET /reservations?guestId=guest-1": () => reply(200, { reservations: [stored] }),
+      "GET /reservations?": () => reply(200, { reservations: [] }),
+      "GET /reservations/guest-counts": () =>
+        reply(200, { counts: [{ guestId: "guest-1", total: 1, active: 1, completed: 0, cancelled: 0 }] }),
+      "GET /reservations/R-STORED": () => reply(200, { ...stored, additionalGuests: [] }),
+      "GET /guests": () =>
         reply(200, {
           guests: [
-            {
-              id: "guest-1",
-              firstName: "Test",
-              lastName: "Guest",
-              email: "guest@example.com",
-              phone: null,
-            },
+            { id: "guest-1", firstName: "Test", lastName: "Guest", email: "guest@example.com", phone: "0812345678", idDocument: "****4567", hasAccount: true, createdAt: "2026-10-01T00:00:00Z" },
+            { id: "guest-2", firstName: "Walk", lastName: "In", email: "walkin@example.com", phone: null, hasAccount: false, createdAt: "2026-10-02T00:00:00Z" },
           ],
         }),
     });
 
     render(<App />);
-  await screen.findByRole("button", { name: /Guests$/ });
-    await userEvent.click(screen.getByRole("button", { name: /Guests$/ }));
-    await userEvent.type(
-      screen.getByLabelText("Name, email or phone"),
-      "test",
-    );
-    await userEvent.click(
-      screen.getByRole("button", { name: "Search guests" }),
-    );
-    await userEvent.click(
-      await screen.findByRole("button", { name: "View stays" }),
-    );
+    await userEvent.click(await screen.findByRole("button", { name: /Guests$/ }));
 
-    const history = await screen.findByRole("list", { name: "Stay history" });
-    expect(within(history).getByText(/R-STORED/)).toBeInTheDocument();
-    expect(calls("GET", "/guests/search?q=test")).toHaveLength(1);
+    const directory = await screen.findByRole("table", { name: "Guest results" });
+    expect(within(directory).getByText("guest@example.com")).toBeInTheDocument();
+    expect(within(directory).getByText("walkin@example.com")).toBeInTheDocument();
+    expect(within(directory).getByText("****4567")).toBeInTheDocument();
+    expect(within(directory).getByText("Online account")).toBeInTheDocument();
+    expect(within(directory).getByRole("button", { name: "0 bookings for Walk In" })).toBeInTheDocument();
+
+    await userEvent.click(within(directory).getByRole("button", { name: "1 bookings for Test Guest" }));
+    const bookings = await screen.findByRole("table", { name: "Guest bookings" });
+    expect(await within(bookings).findByText("R-STORED")).toBeInTheDocument();
+    expect(within(bookings).getByText("2027-03-10 → 2027-03-13")).toBeInTheDocument();
+
+    await userEvent.click(within(bookings).getByRole("row", { name: "Open booking R-STORED" }));
+    expect(await screen.findByRole("dialog", { name: "Booking R-STORED" })).toBeInTheDocument();
   });
 });
 
@@ -398,5 +398,43 @@ describe("authentication screen", () => {
 
     expect(screen.getByLabelText("Username or email")).toBeInTheDocument();
     expect(screen.queryByLabelText("First name")).not.toBeInTheDocument();
+  });
+});
+
+describe("front desk stay handling", () => {
+  it("checks a paid booking in and out and then shows Succeeded", async () => {
+    let current = { ...stored, checkIn: "2020-01-01", checkOut: "2099-01-01", checkedInAt: null, checkedOutAt: null };
+    mockApi({
+      "GET /reservations": () => reply(200, { reservations: [current] }),
+      "POST /reservations/R-STORED/check-in": () => {
+        current = { ...current, checkedInAt: "2026-10-17T14:05:00Z" };
+        return reply(200, current);
+      },
+      "POST /reservations/R-STORED/check-out": () => {
+        current = { ...current, checkedOutAt: "2026-10-19T10:30:00Z" };
+        return reply(200, current);
+      },
+    });
+    render(<App />);
+
+    const table = await screen.findByRole("table");
+    await userEvent.click(await within(table).findByRole("button", { name: "Check in" }));
+    await userEvent.click(await within(table).findByRole("button", { name: "Check out" }));
+
+    expect(await within(table).findByText("Succeeded")).toBeInTheDocument();
+    expect(calls("POST", "/reservations/R-STORED/check-in")).toHaveLength(1);
+    expect(calls("POST", "/reservations/R-STORED/check-out")).toHaveLength(1);
+    expect(within(table).queryByRole("button", { name: /Check (in|out)/ })).not.toBeInTheDocument();
+  });
+
+  it("does not allow check-in until the payment is approved", async () => {
+    mockApi({
+      "GET /reservations": () =>
+        reply(200, { reservations: [{ ...stored, status: "pending", checkIn: "2020-01-01", checkOut: "2099-01-01" }] }),
+    });
+    render(<App />);
+
+    const table = await screen.findByRole("table");
+    expect(await within(table).findByRole("button", { name: "Check in" })).toBeDisabled();
   });
 });

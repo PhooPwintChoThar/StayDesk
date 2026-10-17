@@ -1,7 +1,10 @@
 import { readFile } from 'node:fs/promises';
 import request from 'supertest';
-import { app } from '../app.js';
+import { createApp } from '../app.js';
 import { pool } from '../db.js';
+
+let activeReservations = false;
+const app = createApp({ hasActiveReservations: async () => activeReservations });
 
 beforeAll(async () => {
   await pool.query(await readFile(new URL('../schema.sql', import.meta.url), 'utf8'));
@@ -9,6 +12,7 @@ beforeAll(async () => {
 
 beforeEach(async () => {
   await pool.query('TRUNCATE guests CASCADE');
+  activeReservations = false;
 });
 
 afterAll(async () => {
@@ -189,8 +193,15 @@ describe('guest endpoints', () => {
     expect(exported.body.guest.email).toBe('loyalty@example.com');
     expect(exported.body.exportedAt).toBeDefined();
 
+    activeReservations = true;
+    const blocked = await request(app).delete(`/guests/${created.body.id}`);
+    expect(blocked.status).toBe(409);
+
+    activeReservations = false;
     const deleted = await request(app).delete(`/guests/${created.body.id}`);
     expect(deleted.status).toBe(204);
+    expect((await request(app).get(`/guests/${created.body.id}`)).status).toBe(404);
+    expect((await request(app).delete(`/guests/${created.body.id}`)).status).toBe(404);
   });
 
   it('registers and logs in a guest with a password', async () => {
@@ -337,4 +348,48 @@ describe('guest endpoints', () => {
     expect(emptySearch.status).toBe(400);
     expect(invalidGuest.status).toBe(400);
   });
+
+  it('stores a passport number given at booking on an existing profile without overwriting one', async () => {
+    const created = await request(app).post('/guests/get-or-create').send({
+      email: 'returning@example.com', firstName: 'Re', lastName: 'Turn'
+    });
+
+    const withPassport = await request(app).post('/guests/get-or-create').set('x-user-role', 'manager').send({
+      email: 'returning@example.com', firstName: 'Re', lastName: 'Turn', idDocument: 'P7654321'
+    });
+    const another = await request(app).post('/guests/get-or-create').set('x-user-role', 'manager').send({
+      email: 'returning@example.com', firstName: 'Re', lastName: 'Turn', idDocument: 'OTHER-1'
+    });
+
+    expect(withPassport.status).toBe(200);
+    expect(withPassport.body).toMatchObject({ id: created.body.id, idDocument: 'P7654321' });
+    expect(another.body.idDocument).toBe('P7654321');
+  });
+
+  it('lists every guest profile for staff, masking ID numbers for agents', async () => {
+    await request(app).post('/auth/register').send({
+      email: 'ada@example.com', firstName: 'Ada', lastName: 'Lovelace', password: 'secret123', idDocument: 'P1234567'
+    });
+    await request(app).post('/guests/get-or-create').send({ email: 'walkin@example.com', firstName: 'Walk', lastName: 'In' });
+
+    const asAgent = await request(app).get('/guests').set('x-user-role', 'agent');
+    expect(asAgent.status).toBe(200);
+    expect(asAgent.body.guests.map((guest) => [guest.email, guest.hasAccount])).toEqual([
+      ['walkin@example.com', false],
+      ['ada@example.com', true]
+    ]);
+    expect(asAgent.body.guests[1]).toMatchObject({ idDocument: '****4567', createdAt: expect.any(String) });
+
+    const asManager = await request(app).get('/guests').query({ q: 'ada love' }).set('x-user-role', 'manager');
+    expect(asManager.body.guests).toHaveLength(1);
+    expect(asManager.body.guests[0].idDocument).toBe('P1234567');
+
+    expect((await request(app).get('/guests').query({ ids: 'not-a-uuid' })).status).toBe(400);
+
+    await request(app).post('/guests/get-or-create').set('x-user-role', 'manager')
+      .send({ email: 'gold@example.com', firstName: 'Gold', lastName: 'Member', loyaltyTier: 'gold', loyaltyNumber: 'GOLD-77' });
+    const byLoyalty = await request(app).get('/guests').query({ q: 'gold-77' }).set('x-user-role', 'agent');
+    expect(byLoyalty.body.guests.map((guest) => guest.email)).toEqual(['gold@example.com']);
+  });
 });
+

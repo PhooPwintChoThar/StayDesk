@@ -178,11 +178,157 @@ describe('gateway authentication and proxying', () => {
     const app = createApp({ secret });
 
     const response = await request(app)
-      .post('/deposits')
-      .set('Authorization', `Bearer ${token('guest')}`)
-      .send({ amount: 10 });
+      .get('/guests/search?q=smith')
+      .set('Authorization', `Bearer ${token('guest')}`);
 
     expect(response.status).toBe(403);
+  });
+
+  it('never exposes internal hold, deposit or refund endpoints', async () => {
+    const app = createApp({ secret });
+
+    for (const [method, path] of [['post', '/deposits'], ['post', '/refunds'], ['post', '/holds'], ['delete', '/holds/h-1'], ['get', '/payments/reservations/R-1/totals'], ['post', '/settlements'], ['post', '/deposits/capture']]) {
+      const response = await request(app)[method](path)
+        .set('Authorization', `Bearer ${token('manager', { sub: 'manager' })}`)
+        .send({});
+      expect(response.status).toBe(404);
+    }
+  });
+
+  it('passes payment files and room photos through byte for byte', async () => {
+    const app = createApp({ secret });
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0x00, 0xfe, 0x80]);
+    nock(billingUrl)
+      .get('/payments/proofs/p-1/file')
+      .times(2)
+      .reply(200, png, { 'Content-Type': 'image/png', 'Content-Disposition': "attachment; filename*=UTF-8''p.png" });
+    nock(roomRateUrl)
+      .get('/room-types/standard/photos/ph-1')
+      .reply(200, png, { 'Content-Type': 'image/jpeg', 'Cache-Control': 'public, max-age=86400' });
+    const binary = (req) => req.buffer(true).parse((res, done) => {
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => done(null, Buffer.concat(chunks)));
+    });
+
+    for (let view = 0; view < 2; view += 1) {
+      const file = await binary(request(app)
+        .get('/payments/proofs/p-1/file')
+        .set('Authorization', `Bearer ${token('agent', { sub: 'agent' })}`));
+      expect(file.status).toBe(200);
+      expect(file.headers['content-type']).toBe('image/png');
+      expect(file.headers['content-disposition']).toContain('p.png');
+      expect(Buffer.compare(file.body, png)).toBe(0);
+    }
+
+    const photo = await binary(request(app).get('/room-types/standard/photos/ph-1'));
+    expect(photo.status).toBe(200);
+    expect(photo.headers['cache-control']).toContain('max-age');
+    expect(Buffer.compare(photo.body, png)).toBe(0);
+  });
+
+  it('keeps payment approval internal and check-in for staff only', async () => {
+    const app = createApp({ secret });
+    nock(reservationUrl).post('/reservations/R-1/check-in').reply(200, { checkedInAt: 'now' });
+
+    const approve = await request(app)
+      .post('/reservations/R-1/payment-approved')
+      .set('Authorization', `Bearer ${token('manager', { sub: 'manager' })}`);
+    const guestCheckIn = await request(app)
+      .post('/reservations/R-1/check-in')
+      .set('Authorization', `Bearer ${token('guest', { guestId: 'g-1' })}`);
+    const agentCheckIn = await request(app)
+      .post('/reservations/R-1/check-in')
+      .set('Authorization', `Bearer ${token('agent', { sub: 'reception' })}`);
+
+    expect(approve.status).toBe(404);
+    expect(guestCheckIn.status).toBe(403);
+    expect(agentCheckIn.status).toBe(200);
+  });
+
+  it('keeps the guest directory and booking counts for staff only', async () => {
+    const app = createApp({ secret });
+    nock(reservationUrl).get('/reservations/guest-counts').reply(200, { counts: [] });
+    nock(guestUrl).get('/guests').reply(200, { guests: [] });
+    nock(reservationUrl).get('/reservations/guest-counts').reply(200, { counts: [] });
+    const guestToken = `Bearer ${token('guest', { guestId: 'g-1' })}`;
+    const agentToken = `Bearer ${token('agent', { sub: 'reception' })}`;
+
+    expect((await request(app).get('/guests').set('Authorization', guestToken)).status).toBe(403);
+    expect((await request(app).get('/reservations/guest-counts').set('Authorization', guestToken)).status).toBe(403);
+    expect((await request(app).get('/guests').set('Authorization', agentToken)).status).toBe(200);
+    expect((await request(app).get('/reservations/guest-counts').set('Authorization', agentToken)).status).toBe(200);
+  });
+
+  it('sends the internal token on guest sign-in and registration', async () => {
+    process.env.INTERNAL_TOKEN = 'internal-secret';
+    try {
+      const app = createApp({ secret });
+      const register = nock(guestUrl, { reqheaders: { 'x-internal-token': 'internal-secret' } })
+        .post('/auth/register').reply(201, { guestId: 'g-9' });
+      const login = nock(guestUrl, { reqheaders: { 'x-internal-token': 'internal-secret' } })
+        .post('/auth/login').reply(200, { guestId: 'g-9' });
+
+      expect((await request(app).post('/auth/register').send({ email: 'a@b.c' })).status).toBe(201);
+      const signIn = await request(app).post('/login').set('x-forwarded-for', uniqueIp(77)).send({ username: 'a@b.c', password: 'secret123' });
+      expect(signIn.status).toBe(200);
+      expect(register.isDone() && login.isDone()).toBe(true);
+    } finally {
+      delete process.env.INTERNAL_TOKEN;
+    }
+  });
+
+  it('lets agents check room availability', async () => {
+    const app = createApp({ secret });
+    nock(roomRateUrl).get('/rooms/availability').query(true).reply(200, { rooms: [] });
+
+    const response = await request(app)
+      .get('/rooms/availability?checkIn=2027-01-01&checkOut=2027-01-02')
+      .set('Authorization', `Bearer ${token('agent', { sub: 'reception' })}`);
+
+    expect(response.status).toBe(200);
+  });
+
+  it('lets only managers change rooms and room types, and keeps rooms away from guests', async () => {
+    const app = createApp({ secret });
+    const upstream = nock(roomRateUrl)
+      .post('/room-types')
+      .reply(201, { id: 'suite' })
+      .put('/rooms/r-1/maintenance')
+      .reply(200, { id: 'r-1', status: 'maintenance' })
+      .get('/rooms')
+      .reply(200, { rooms: [] });
+
+    const agentCreate = await request(app)
+      .post('/rooms')
+      .set('Authorization', `Bearer ${token('agent', { sub: 'agent' })}`)
+      .send({ roomNumber: '1' });
+    const agentMaintenance = await request(app)
+      .put('/rooms/r-1/maintenance')
+      .set('Authorization', `Bearer ${token('agent', { sub: 'agent' })}`)
+      .send({});
+    const guestList = await request(app)
+      .get('/rooms')
+      .set('Authorization', `Bearer ${token('guest', { guestId: 'g-1' })}`);
+    const managerType = await request(app)
+      .post('/room-types')
+      .set('Authorization', `Bearer ${token('manager', { sub: 'manager' })}`)
+      .send({ name: 'Suite' });
+    const managerMaintenance = await request(app)
+      .put('/rooms/r-1/maintenance')
+      .set('Authorization', `Bearer ${token('manager', { sub: 'manager' })}`)
+      .send({ from: '2027-01-01', to: '2027-01-02' });
+    const agentList = await request(app)
+      .get('/rooms')
+      .set('Authorization', `Bearer ${token('agent', { sub: 'agent' })}`);
+
+    expect(agentCreate.status).toBe(403);
+    expect(agentMaintenance.status).toBe(403);
+    expect(guestList.status).toBe(403);
+    expect(managerType.status).toBe(201);
+    expect(managerMaintenance.status).toBe(200);
+    expect(agentList.status).toBe(200);
+    expect(upstream.isDone()).toBe(true);
   });
 
   it('issues a JWT for a credential login', async () => {

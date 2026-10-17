@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { apiRequest } from "./api.js";
+import { showToast } from "./toast.js";
 
 const editableFields = ["firstName", "lastName", "phone", "address", "idDocument", "preferences"];
 
@@ -9,7 +10,6 @@ export default function MyProfileScreen({ session }) {
   const [state, setState] = useState(guestId ? "loading" : "missing");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [success, setSuccess] = useState("");
 
   useEffect(() => {
     if (!guestId) {
@@ -40,7 +40,6 @@ export default function MyProfileScreen({ session }) {
     if (!profile || busy) return;
     setBusy(true);
     setError("");
-    setSuccess("");
     try {
       const updated = await apiRequest(`/guests/${encodeURIComponent(guestId)}`, {
         method: "PUT",
@@ -55,7 +54,7 @@ export default function MyProfileScreen({ session }) {
         }),
       });
       setProfile(updated);
-      setSuccess("Profile updated.");
+      showToast("Your profile has been saved.", { title: "Profile updated" });
     } catch (err) {
       setError(err.message);
     } finally {
@@ -65,7 +64,6 @@ export default function MyProfileScreen({ session }) {
 
   function updateField(field, value) {
     setProfile((current) => ({ ...current, [field]: value }));
-    setSuccess("");
   }
 
   return (
@@ -89,7 +87,6 @@ export default function MyProfileScreen({ session }) {
           {error}
         </p>
       )}
-      {success && <p role="status">{success}</p>}
 
       {state === "ready" && profile && (
         <form onSubmit={saveProfile} className="form-grid" aria-label="Edit profile">

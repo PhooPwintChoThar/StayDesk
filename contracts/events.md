@@ -17,7 +17,13 @@ details and the preferred notification channel are optional.
 | `guestPhone` | string, optional | Guest phone used for notification, when known |
 | `notificationChannel` | string, optional | `email` or `sms`; omitted values use `NOTIFICATION_CHANNEL` |
 | `channel` | string, optional legacy alias | Existing publishers may use `email` or `sms` in this field |
+| `guestName` | string, optional | Guest full name for the greeting |
 | `roomTypeId` | string | Reserved room type |
+| `roomNumber` | string, optional | Room assigned to the stay |
+| `guests` | number, optional | Number of guests |
+| `depositAmount` | number, optional | Deposit charged (`ReservationConfirmed`) |
+| `refundAmount` | number, optional | Refund issued (`ReservationCancelled`) |
+| `cancellationFee` | number, optional | Fee kept (`ReservationCancelled`) |
 | `checkIn` | string | Check-in date in `YYYY-MM-DD` format |
 | `checkOut` | string | Check-out date in `YYYY-MM-DD` format |
 | `totalAmount` | number | Reservation amount |
@@ -55,4 +61,18 @@ API request.
 | `currency` | string | ISO 4217 currency code |
 | `status` | string | `approved` or `rejected` |
 | `reviewNote` | string, optional | Reviewer note, typically present for a rejection |
-| `notificationChannel` | string | `email` or `sms` |
+| `notificationChannel` | string | `email` whenever the guest has an email address |
+| `checkIn`, `checkOut` | string, approvals only | Stay dates |
+| `roomTypeId`, `roomNumber` | string, approvals only | Booked room |
+| `totalAmount` | number, approvals only | Booking total |
+| `paidToDate` | number, approvals only | Deposit plus all approved proofs |
+| `balanceDue` | number, approvals only | Remaining balance; `0` means fully paid |
+
+An approval is the guest's payment confirmation and is always sent by email.
+
+## Delivery
+
+The notification service sends email over SMTP (Mailpit by default in Docker
+Compose) and records every attempt in `notification_db.notifications` with
+status `sent`, `failed` (retried after 5 s) or `skipped` (malformed payload or
+no recipient; dropped instead of requeued).

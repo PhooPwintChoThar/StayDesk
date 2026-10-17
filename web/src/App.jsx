@@ -12,6 +12,12 @@ import {
 } from "./api.js";
 import MyProfileScreen from "./MyProfileScreen.jsx";
 import PaymentsScreen from "./PaymentsScreen.jsx";
+import RoomManagementScreen, { localToday } from "./RoomManagementScreen.jsx";
+import RoomCards from "./RoomCards.jsx";
+import BookingDetails from "./BookingDetails.jsx";
+import GuestsScreen from "./GuestsScreen.jsx";
+import Toaster from "./Toaster.jsx";
+import { showToast } from "./toast.js";
 
 const DEV_ROLE_SWITCH = import.meta.env.VITE_DEV_ROLE_SWITCH === "true";
 
@@ -31,6 +37,7 @@ const initialGuest = {
   preferences: "",
   consent: false,
   channel: "email",
+  additionalGuests: [],
 };
 const initialFilters = { from: "", to: "", status: "", roomTypeId: "", q: "" };
 
@@ -45,13 +52,14 @@ const ROLES = [
 const ALLOWED_VIEWS = {
   guest: ["reservations", "payments", "profile"],
   agent: ["reservations", "guests", "payments"],
-  manager: ["reservations", "guests", "payments"],
+  manager: ["reservations", "guests", "payments", "rooms"],
 };
 
 const NAV_ITEMS = {
   reservations: { label: "Reservations", icon: "calendar" },
   guests: { label: "Guests", icon: "guests" },
   payments: { label: "Payments", icon: "billing" },
+  rooms: { label: "Room management", icon: "bed" },
   profile: { label: "My profile", icon: "guests" },
 };
 
@@ -59,6 +67,7 @@ function viewHeading(view, role) {
   if (view === "payments") return { eyebrow: "Billing", title: "Payments" };
   if (view === "profile") return { eyebrow: "Guest services", title: "My profile" };
   if (view === "guests") return { eyebrow: "Guest services", title: "Guest Lookup" };
+  if (view === "rooms") return { eyebrow: "Hotel setup", title: "Room management" };
   if (role === "guest") {
     return { eyebrow: "Guest services", title: "Book a room / My bookings" };
   }
@@ -66,6 +75,79 @@ function viewHeading(view, role) {
 }
 
 const day = (value) => String(value ?? "").slice(0, 10);
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function nextDay(value) {
+  const date = new Date(`${value}T00:00:00Z`);
+  if (Number.isNaN(date.getTime())) return "";
+  date.setUTCDate(date.getUTCDate() + 1);
+  return date.toISOString().slice(0, 10);
+}
+
+// A stay can be changed until the guest checks in or its check-out date passes.
+const isOpenStay = (reservation) =>
+  ["pending", "confirmed"].includes(reservation.status) &&
+  !reservation.checkedInAt &&
+  day(reservation.checkOut) > localToday();
+
+// Guests may cancel only while the booking is still waiting for payment approval.
+const canCancel = (reservation, role) =>
+  isOpenStay(reservation) && (role !== "guest" || reservation.status === "pending");
+
+function dateTime(value) {
+  if (!value) return "—";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime())
+    ? "—"
+    : date.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+}
+
+const STATUS_LABELS = { pending: "pending payment", confirmed: "confirmed", cancelled: "cancelled" };
+
+// Guests change their booking themselves only while it waits for payment;
+// the front desk can change dates until check-in.
+const canModify = (reservation, role) =>
+  isOpenStay(reservation) && (role !== "guest" || reservation.status === "pending");
+
+const blankPerson = { name: "", idDocument: "" };
+
+function partyOf(list, count) {
+  return Array.from({ length: Math.max(0, (Number(count) || 1) - 1) }, (_, index) => list?.[index] || blankPerson);
+}
+
+// Name and passport/ID for guests 2..n (guest 1 is the person booking).
+function PartyFields({ count, party, onChange }) {
+  const people = partyOf(party, count);
+  if (!people.length) return null;
+  const update = (index, field, value) =>
+    onChange(people.map((person, i) => (i === index ? { ...person, [field]: value } : person)));
+  return (
+    <div className="guest-party">
+      <h4>Other guests staying</h4>
+      {people.map((person, index) => (
+        <div className="guest-party-row" key={index}>
+          <label>
+            Guest {index + 2} full name
+            <input
+              required
+              value={person.name}
+              onChange={(event) => update(index, "name", event.target.value)}
+            />
+          </label>
+          <label>
+            Guest {index + 2} passport or ID number
+            <input
+              required
+              value={person.idDocument}
+              onChange={(event) => update(index, "idDocument", event.target.value)}
+            />
+          </label>
+        </div>
+      ))}
+    </div>
+  );
+}
 
 function nights(checkIn, checkOut) {
   const diff =
@@ -81,6 +163,7 @@ const ICONS = {
   check: "M5 12l4 4 10-10",
   close: "M6 6l12 12 M18 6L6 18",
   cash: "M12 3v18 M16 7c0-2-2-3-4-3s-4 1-4 3 2 3 4 3 4 1 4 3-2 3-4 3-4-1-4-3",
+  bed: "M21 15v2a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-2M17 17v-2a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v2",
 };
 
 function Icon({ name, size = 18, className = "nav-icon" }) {
@@ -90,6 +173,33 @@ function Icon({ name, size = 18, className = "nav-icon" }) {
            strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
         <path d={ICONS[name]} />
       </svg>
+  );
+}
+
+// Front desk stay control: Check in -> Check out -> Succeeded.
+function StayButton({ reservation, busy, onAction }) {
+  if (reservation.status === "cancelled") return <span className="muted">—</span>;
+  if (reservation.checkedInAt && reservation.checkedOutAt) {
+    return <span className="status-pill succeeded">Succeeded</span>;
+  }
+  if (reservation.checkedInAt) {
+    return (
+      <button type="button" className="page-btn" disabled={busy} onClick={() => onAction("check-out")}>
+        Check out
+      </button>
+    );
+  }
+  const waiting = reservation.status !== "confirmed";
+  return (
+    <button
+      type="button"
+      className="page-btn"
+      disabled={busy || waiting}
+      title={waiting ? "Waiting for the payment to be approved" : undefined}
+      onClick={() => onAction("check-in")}
+    >
+      Check in
+    </button>
   );
 }
 
@@ -262,17 +372,13 @@ export default function App() {
   const [bookingOpen, setBookingOpen] = useState(false);
   const [search, setSearch] = useState(initialSearch);
   const [availability, setAvailability] = useState([]);
+  const [searched, setSearched] = useState(null);
+  const [detailsFor, setDetailsFor] = useState(null);
   const [selectedRoom, setSelectedRoom] = useState(null);
   const [guest, setGuest] = useState(initialGuest);
-  const [confirmation, setConfirmation] = useState(null);
 
-  const [guestQuery, setGuestQuery] = useState("");
-  const [guests, setGuests] = useState([]);
-  const [selectedGuest, setSelectedGuest] = useState(null);
-  const [guestReservations, setGuestReservations] = useState([]);
   const [roomTypeOptions, setRoomTypeOptions] = useState([]);
-  const [lookupNo, setLookupNo] = useState("");
-  const [lookedUp, setLookedUp] = useState(null);
+  const [guestNames, setGuestNames] = useState({});
 
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -354,15 +460,9 @@ export default function App() {
   function resetWorkspace() {
     setError("");
     setAuthError("");
-    setGuests([]);
-    setSelectedGuest(null);
-    setGuestReservations([]);
-    setLookedUp(null);
-    setLookupNo("");
     setOpenMenu(null);
     setEditing(null);
     setBookingOpen(false);
-    setConfirmation(null);
   }
 
   function handleLogout() {
@@ -394,6 +494,43 @@ export default function App() {
     if (session && activeView === "reservations") loadReservations();
   }, [session, activeView, loadReservations]);
 
+  const loadRoomTypes = useCallback(() => {
+    return apiRequest("/room-types")
+      .then((result) => setRoomTypeOptions(result.roomTypes || []))
+      .catch((err) => {
+        setRoomTypeOptions([]);
+        setError(err.message);
+      });
+  }, []);
+
+  useEffect(() => {
+    if (session) loadRoomTypes();
+  }, [session, activeView, loadRoomTypes]);
+
+  // Staff see guest names instead of raw ids.
+  useEffect(() => {
+    if (!session || role === "guest") return;
+    const missing = [...new Set(reservations.map((item) => item.guestId))].filter(
+      (id) => UUID_PATTERN.test(id) && !(id in guestNames),
+    );
+    if (!missing.length) return;
+    apiRequest(`/guests?ids=${encodeURIComponent(missing.join(","))}`)
+      .then((result) => {
+        setGuestNames((current) => {
+          const next = { ...current };
+          for (const id of missing) next[id] = null;
+          for (const item of result.guests || []) {
+            next[item.id] = `${item.firstName} ${item.lastName}`.trim();
+          }
+          return next;
+        });
+      })
+      .catch(() => {});
+  }, [session, role, reservations, guestNames]);
+
+  const typeName = (id) => roomTypeOptions.find((type) => type.id === id)?.name || id;
+  const guestLabel = (id) => guestNames[id] || `${String(id).slice(0, 8)}…`;
+
   async function changeRole(nextRole) {
     setDevRole(nextRole);
     resetWorkspace();
@@ -413,19 +550,77 @@ export default function App() {
     setEditing(null);
     setSearch(initialSearch);
     setAvailability([]);
+    setSearched(null);
     setSelectedRoom(null);
     setGuest({
       ...initialGuest,
       email: role === "guest" ? session?.claims?.sub || "" : "",
     });
-    setConfirmation(null);
     setError("");
-    apiRequest("/room-types")
-      .then((result) => setRoomTypeOptions(result.roomTypes || []))
-      .catch((err) => {
-        setRoomTypeOptions([]);
-        setError(err.message);
-      });
+    loadRoomTypes();
+    const guestId = session?.claims?.guestId;
+    if (role === "guest" && guestId) {
+      apiRequest(`/guests/${encodeURIComponent(guestId)}`)
+        .then((profile) =>
+          setGuest((current) => ({
+            ...current,
+            firstName: profile.firstName || current.firstName,
+            lastName: profile.lastName || current.lastName,
+            phone: profile.phone || current.phone,
+            address: profile.address || current.address,
+            idDocument: profile.idDocument || current.idDocument,
+            preferences: profile.preferences || current.preferences,
+          })),
+        )
+        .catch(() => {});
+    }
+  }
+
+  async function stayAction(reservation, action) {
+    setError("");
+    const path = `/reservations/${encodeURIComponent(reservation.reservationNo)}`;
+    const options = { method: "POST" };
+    if (action === "check-out") {
+      let summary = null;
+      try {
+        summary = await apiRequest(`${path}/payment-summary`);
+      } catch {
+        // The server re-checks the balance; fall back to a plain confirmation.
+      }
+      const owed = Number(summary?.balanceDue || 0);
+      const question = owed > 0
+        ? `The guest still owes ${owed.toFixed(2)} ${summary.currency}. Confirm the balance was collected at the desk and check out ${reservation.reservationNo}?`
+        : `Check out ${reservation.reservationNo} now? The deposit will be applied to the bill.`;
+      if (!window.confirm(question)) return;
+      if (owed > 0) options.body = JSON.stringify({ collectBalance: true });
+    } else if (!window.confirm(`Check in ${reservation.reservationNo} now?`)) {
+      return;
+    }
+    setBusy(true);
+    try {
+      const updated = await apiRequest(`${path}/${action}`, options);
+      if (updated.statement) {
+        const bill = updated.statement;
+        showToast(
+          [
+            `Total ${bill.totalAmount.toFixed(2)} ${bill.currency}: deposit applied ${bill.depositApplied.toFixed(2)}, payments ${bill.approvedPayments.toFixed(2)}, collected at desk ${bill.collectedAtDesk.toFixed(2)}.`,
+            "Balance due 0.00.",
+          ],
+          { title: `${updated.reservationNo} checked out`, duration: 9000 },
+        );
+      } else if (action === "check-in") {
+        showToast(updated.roomNumber ? `Room ${updated.roomNumber} is now occupied.` : "The guest is checked in.", {
+          title: `${updated.reservationNo} checked in`,
+        });
+      }
+      setReservations((current) =>
+        current.map((item) => (item.reservationNo === updated.reservationNo ? updated : item)),
+      );
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function searchRooms(event) {
@@ -433,7 +628,6 @@ export default function App() {
     setError("");
     setAvailability([]);
     setSelectedRoom(null);
-    setConfirmation(null);
     setBusy(true);
 
     try {
@@ -446,6 +640,7 @@ export default function App() {
 
       const result = await apiRequest(`/availability?${params}`);
       setAvailability((result.availability || []).filter((room) => room.available));
+      setSearched({ checkIn: search.checkIn, checkOut: search.checkOut, guests: search.guests });
     } catch (err) {
       setError(err.message);
     } finally {
@@ -474,15 +669,33 @@ export default function App() {
             consent: guest.consent,
           },
           roomTypeId: selectedRoom.roomTypeId,
-          checkIn: search.checkIn,
-          checkOut: search.checkOut,
-          guests: Number(search.guests) || undefined,
+          checkIn: searched?.checkIn ?? search.checkIn,
+          checkOut: searched?.checkOut ?? search.checkOut,
+          guests: Number(searched?.guests ?? search.guests) || undefined,
+          additionalGuests: partyOf(guest.additionalGuests, searched?.guests ?? search.guests).map((person) => ({
+            name: person.name.trim(),
+            idDocument: person.idDocument.trim(),
+          })),
           channel: guest.channel,
         }),
       });
-      setConfirmation(reservation);
+      showToast(
+        [
+          <>
+            Reservation number: <strong>{reservation.reservationNo}</strong>
+          </>,
+          `Total: ${reservation.totalAmount} ${reservation.currency} · Status: ${reservation.status}`,
+          `Deposit: ${reservation.depositAmount} ${reservation.currency}${reservation.roomNumber ? ` · Room ${reservation.roomNumber}` : ""}`,
+          reservation.status === "pending"
+            ? "The booking is pending until the front desk approves the payment. Upload the payment proof from the Payments page."
+            : "",
+        ],
+        { title: reservation.status === "pending" ? "Booking received" : "Booking confirmed", duration: 10000 },
+      );
+      setBookingOpen(false);
       setSelectedRoom(null);
       setAvailability([]);
+      setSearched(null);
       await loadReservations();
     } catch (err) {
       setError(err.message);
@@ -524,26 +737,8 @@ export default function App() {
     try {
       await apiRequest(path, options);
       await loadReservations();
-      if (lookedUp?.reservationNo === reservationNo) setLookedUp(null);
     } catch (err) {
       setError(err.message);
-    }
-  }
-
-  async function lookupReservation(event) {
-    event.preventDefault();
-    setError("");
-    setLookedUp(null);
-    setBusy(true);
-    try {
-      const reservation = await apiRequest(
-        `/reservations/${encodeURIComponent(lookupNo.trim())}`,
-      );
-      setLookedUp(reservation);
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setBusy(false);
     }
   }
 
@@ -556,7 +751,22 @@ export default function App() {
       roomTypeId: reservation.roomTypeId,
       checkIn: day(reservation.checkIn),
       checkOut: day(reservation.checkOut),
+      originalCheckIn: day(reservation.checkIn),
+      guests: reservation.guests ? String(reservation.guests) : "",
+      additionalGuests: [],
+      datesOnly: role !== "guest",
     });
+    if (role === "guest") {
+      apiRequest(`/reservations/${encodeURIComponent(reservation.reservationNo)}`)
+        .then((full) =>
+          setEditing((current) =>
+            current?.reservationNo === reservation.reservationNo
+              ? { ...current, additionalGuests: full.additionalGuests || [] }
+              : current,
+          ),
+        )
+        .catch(() => {});
+    }
   }
 
   async function saveModify(event) {
@@ -568,92 +778,28 @@ export default function App() {
         `/reservations/${encodeURIComponent(editing.reservationNo)}`,
         {
           method: "PUT",
-          body: JSON.stringify({
-            roomTypeId: editing.roomTypeId,
-            checkIn: editing.checkIn,
-            checkOut: editing.checkOut,
-          }),
+          body: JSON.stringify(
+            editing.datesOnly
+              ? { roomTypeId: editing.roomTypeId, checkIn: editing.checkIn, checkOut: editing.checkOut }
+              : {
+                  roomTypeId: editing.roomTypeId,
+                  checkIn: editing.checkIn,
+                  checkOut: editing.checkOut,
+                  guests: Number(editing.guests) || undefined,
+                  additionalGuests: partyOf(editing.additionalGuests, editing.guests).map((person) => ({
+                    name: person.name.trim(),
+                    idDocument: person.idDocument.trim(),
+                  })),
+                },
+          ),
         },
       );
       setEditing(null);
       await loadReservations();
-      if (lookedUp?.reservationNo === editing.reservationNo) {
-        setLookedUp(null);
-      }
     } catch (err) {
       setError(err.message);
     } finally {
       setBusy(false);
-    }
-  }
-
-  async function searchGuests(event) {
-    event.preventDefault();
-    setError("");
-    setSelectedGuest(null);
-    setGuestReservations([]);
-    setBusy(true);
-    try {
-      const result = await apiRequest(
-        `/guests/search?q=${encodeURIComponent(guestQuery)}`,
-      );
-      setGuests(result.guests || []);
-    } catch (err) {
-      setGuests([]);
-      setError(err.message);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function showGuest(selected) {
-    setError("");
-    setSelectedGuest(selected);
-    try {
-      const result = await apiRequest(
-        `/reservations?guestId=${encodeURIComponent(selected.id)}`,
-      );
-      setGuestReservations(result.reservations || []);
-    } catch (err) {
-      setGuestReservations([]);
-      setError(err.message);
-    }
-  }
-
-  async function exportGuest(guestId) {
-    setError("");
-    try {
-      const result = await apiRequest(
-        `/guests/${encodeURIComponent(guestId)}/export`,
-      );
-      const blob = new Blob([JSON.stringify(result, null, 2)], {
-        type: "application/json",
-      });
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = `guest-${guestId}.json`;
-      link.click();
-      URL.revokeObjectURL(url);
-    } catch (err) {
-      setError(err.message);
-    }
-  }
-
-  async function deleteGuest(guestId) {
-    if (!window.confirm("Permanently delete this guest profile?")) return;
-    setError("");
-    try {
-      await apiRequest(`/guests/${encodeURIComponent(guestId)}`, {
-        method: "DELETE",
-      });
-      setGuests((current) => current.filter((item) => item.id !== guestId));
-      if (selectedGuest?.id === guestId) {
-        setSelectedGuest(null);
-        setGuestReservations([]);
-      }
-    } catch (err) {
-      setError(err.message);
     }
   }
 
@@ -669,11 +815,14 @@ export default function App() {
             (!filters.roomTypeId || reservation.roomTypeId === filters.roomTypeId) &&
             (!query ||
               reservation.reservationNo.toLowerCase().includes(query) ||
-              String(reservation.guestId).toLowerCase().includes(query)),
+              String(reservation.guestId).toLowerCase().includes(query) ||
+              String(guestNames[reservation.guestId] || "").toLowerCase().includes(query) ||
+              String(reservation.roomNumber || "").toLowerCase().includes(query)),
         );
   const confirmedList = reservations.filter((r) => r.status === "confirmed");
   const confirmedCount = confirmedList.length;
   const cancelledCount = reservations.filter((r) => r.status === "cancelled").length;
+  const pendingCount = reservations.filter((r) => r.status === "pending").length;
   const confirmedRevenue = confirmedList.reduce(
       (sum, r) => sum + (Number(r.totalAmount) || 0), 0);
   const revenueCurrency = reservations[0]?.currency || "";
@@ -708,6 +857,7 @@ export default function App() {
 
   return (
     <main className="page-shell">
+      <Toaster />
       <aside className="sidebar">
         <div className="brand-block">
           <div className="brand-mark">H</div>
@@ -728,7 +878,9 @@ export default function App() {
               }}
             >
               <Icon name={NAV_ITEMS[item].icon} />
-              <span>{NAV_ITEMS[item].label}</span>
+              <span>
+                {NAV_ITEMS[item].label}
+              </span>
             </button>
           ))}
         </nav>
@@ -781,75 +933,52 @@ export default function App() {
             {error}
           </p>
         )}
+        {detailsFor && (
+          <BookingDetails
+            reservationNo={detailsFor.reservationNo}
+            roomTypeName={typeName(detailsFor.roomTypeId)}
+            viewerRole={role}
+            onClose={() => setDetailsFor(null)}
+            actions={(full) => (
+              <>
+                {canModify(full, role) && (
+                  <button
+                    type="button"
+                    className="primary-action"
+                    onClick={() => {
+                      setDetailsFor(null);
+                      startModify(full);
+                    }}
+                  >
+                    {role === "guest" ? "Modify booking" : "Change dates"}
+                  </button>
+                )}
+                {canCancel(full, role) && (
+                  <button
+                    type="button"
+                    className="page-btn"
+                    onClick={() => {
+                      setDetailsFor(null);
+                      cancelReservation(full.reservationNo);
+                    }}
+                  >
+                    Cancel booking
+                  </button>
+                )}
+              </>
+            )}
+          />
+        )}
 
         {activeView === "reservations" && (
           <>
-            {role !== "guest" && (
-            <section className="register-panel" aria-labelledby="lookup-heading">
-              <div className="register-header">
-                <div>
-                  <h2 id="lookup-heading">Look up a reservation</h2>
-                  <p className="muted">Find a booking by confirmation number</p>
-                </div>
-              </div>
-              <form onSubmit={lookupReservation} className="form-grid">
-                <label>
-                  Confirmation number
-                  <input
-                    required
-                    value={lookupNo}
-                    onChange={(event) => setLookupNo(event.target.value)}
-                    placeholder="R-…"
-                  />
-                </label>
-                <button disabled={busy} type="submit" className="primary-action">
-                  Find reservation
-                </button>
-              </form>
-              {lookedUp && (
-                <div className="confirmation-card" role="status">
-                  <p>
-                    <strong>{lookedUp.reservationNo}</strong>
-                    {" · "}
-                    {lookedUp.roomTypeId}
-                    {" · "}
-                    {day(lookedUp.checkIn)} to {day(lookedUp.checkOut)}
-                    {" · "}
-                    {lookedUp.totalAmount} {lookedUp.currency}
-                  </p>
-                  <span className={`status-pill ${lookedUp.status}`}>
-                    {lookedUp.status}
-                  </span>
-                  {lookedUp.status === "confirmed" && (
-                    <div className="lookup-actions">
-                      <button
-                        type="button"
-                        className="page-btn"
-                        onClick={() => startModify(lookedUp)}
-                      >
-                        Modify
-                      </button>
-                      <button
-                        type="button"
-                        className="page-btn"
-                        onClick={() => cancelReservation(lookedUp.reservationNo)}
-                      >
-                        Cancel
-                      </button>
-                    </div>
-                  )}
-                </div>
-              )}
-            </section>
-            )}
-
             {role !== "guest" && (
             <section className="kpi-grid" aria-label="Booking summary">
               <article className="kpi-card kpi-primary">
                 <div className="kpi-top"><span>Total bookings</span>
                   <span className="kpi-icon"><Icon name="calendar" /></span></div>
                 <strong>{reservations.length}</strong>
-                <small>in current view</small>
+                <small>{pendingCount} awaiting payment</small>
               </article>
               <article className="kpi-card">
                 <div className="kpi-top"><span>Confirmed</span>
@@ -895,6 +1024,7 @@ export default function App() {
                     <input
                       type="date"
                       required
+                      min={localToday()}
                       value={search.checkIn}
                       onChange={(event) =>
                         setSearch({ ...search, checkIn: event.target.value })
@@ -906,6 +1036,7 @@ export default function App() {
                     <input
                       type="date"
                       required
+                      min={nextDay(search.checkIn || localToday())}
                       value={search.checkOut}
                       onChange={(event) =>
                         setSearch({ ...search, checkOut: event.target.value })
@@ -949,36 +1080,33 @@ export default function App() {
                   </button>
                 </form>
 
-                {availability.length > 0 && (
-                  <ul aria-label="Available rooms" className="room-list">
-                    {availability.map((room) => (
-                      <li key={room.roomTypeId}>
-                        <span>
-                          {room.name || room.roomTypeId} —{" "}
-                          {room.roomsAvailable ??
-                            (room.available ? "Available" : "Unavailable")}
-                          {" · "}
-                          {room.nightlyRate} {room.currency} per night
-                          {room.maxOccupancy
-                            ? ` · up to ${room.maxOccupancy} guests`
-                            : ""}
-                        </span>
-                        <button
-                          type="button"
-                          className="page-btn"
-                          disabled={!room.available || busy}
-                          onClick={() => setSelectedRoom(room)}
-                        >
-                          Select
-                        </button>
-                      </li>
-                    ))}
-                  </ul>
+                {searched && availability.length > 0 && (
+                  <>
+                    <h3>
+                      {availability.length} room type{availability.length === 1 ? "" : "s"} available ·{" "}
+                      {day(searched.checkIn)} to {day(searched.checkOut)}
+                    </h3>
+                    <RoomCards
+                      rooms={availability}
+                      nights={nights(searched.checkIn, searched.checkOut)}
+                      guests={searched.guests}
+                      selectedId={selectedRoom?.roomTypeId}
+                      onSelect={setSelectedRoom}
+                      busy={busy}
+                    />
+                  </>
                 )}
-                {availability.length === 0 && !busy && !confirmation && (
-                  <p>
-                    No availability results yet. Search dates to find rooms.
+                {searched && availability.length === 0 && !busy && (
+                  <p className="muted">
+                    No rooms are free for those dates and guests. Try other dates.
                   </p>
+                )}
+                {!searched && roomTypeOptions.length > 0 && (
+                  <>
+                    <h3>Our rooms</h3>
+                    <p className="muted">Choose your dates above to see prices for your stay.</p>
+                    <RoomCards rooms={roomTypeOptions} />
+                  </>
                 )}
 
                 {selectedRoom && (
@@ -1039,8 +1167,9 @@ export default function App() {
                         />
                       </label>
                       <label>
-                        Passport or ID number (optional)
+                        Passport or ID number
                         <input
+                          required
                           value={guest.idDocument}
                           onChange={(event) =>
                             setGuest({
@@ -1074,6 +1203,11 @@ export default function App() {
                           <option value="sms">SMS</option>
                         </select>
                       </label>
+                      <PartyFields
+                        count={searched?.guests ?? search.guests}
+                        party={guest.additionalGuests}
+                        onChange={(additionalGuests) => setGuest({ ...guest, additionalGuests })}
+                      />
                       <label className="consent-row">
                         <input
                           type="checkbox"
@@ -1098,22 +1232,6 @@ export default function App() {
                   </>
                 )}
 
-                {confirmation && (
-                    <section aria-labelledby="confirmation-heading" role="status" className="confirmation-card">
-                    <h3 id="confirmation-heading">Booking confirmed</h3>
-                    <p>
-                      Reservation number:{" "}
-                      <strong>{confirmation.reservationNo}</strong>
-                    </p>
-                    <p>
-                      Total: {confirmation.totalAmount} {confirmation.currency}
-                      {" · "}Status: {confirmation.status}
-                    </p>
-                    <p>
-                      Deposit: {confirmation.depositAmount} {confirmation.currency}
-                    </p>
-                  </section>
-                )}
               </section>
             )}
 
@@ -1123,7 +1241,9 @@ export default function App() {
                 className="register-panel"
               >
                 <div className="register-header">
-                  <h2 id="modify-heading">Modify {editing.reservationNo}</h2>
+                  <h2 id="modify-heading">
+                    {editing.datesOnly ? "Change dates for" : "Modify"} {editing.reservationNo}
+                  </h2>
                   <button
                     type="button"
                     className="page-btn"
@@ -1138,6 +1258,7 @@ export default function App() {
                     <input
                       type="date"
                       required
+                      min={editing.originalCheckIn < localToday() ? editing.originalCheckIn : localToday()}
                       value={editing.checkIn}
                       onChange={(event) =>
                         setEditing({ ...editing, checkIn: event.target.value })
@@ -1149,15 +1270,18 @@ export default function App() {
                     <input
                       type="date"
                       required
+                      min={nextDay(editing.checkIn)}
                       value={editing.checkOut}
                       onChange={(event) =>
                         setEditing({ ...editing, checkOut: event.target.value })
                       }
                     />
                   </label>
+                  {!editing.datesOnly && (
+                  <>
                   <label>
                     Room type
-                    <input
+                    <select
                       required
                       value={editing.roomTypeId}
                       onChange={(event) =>
@@ -1166,8 +1290,35 @@ export default function App() {
                           roomTypeId: event.target.value,
                         })
                       }
+                    >
+                      {!roomTypeOptions.some((type) => type.id === editing.roomTypeId) && (
+                        <option value={editing.roomTypeId}>{editing.roomTypeId}</option>
+                      )}
+                      {roomTypeOptions.map((type) => (
+                        <option key={type.id} value={type.id}>
+                          {type.name} (up to {type.maxOccupancy} guests)
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    Guests
+                    <input
+                      type="number"
+                      min="1"
+                      value={editing.guests}
+                      onChange={(event) =>
+                        setEditing({ ...editing, guests: event.target.value })
+                      }
                     />
                   </label>
+                  <PartyFields
+                    count={editing.guests}
+                    party={editing.additionalGuests}
+                    onChange={(additionalGuests) => setEditing({ ...editing, additionalGuests })}
+                  />
+                  </>
+                  )}
                   <button
                     disabled={busy}
                     type="submit"
@@ -1232,6 +1383,7 @@ export default function App() {
                     }
                   >
                     <option value="">All Statuses</option>
+                    <option value="pending">Pending payment</option>
                     <option value="confirmed">Confirmed</option>
                     <option value="cancelled">Cancelled</option>
                   </select>
@@ -1248,7 +1400,7 @@ export default function App() {
                     <option value="">All Room Types</option>
                     {roomTypes.map((type) => (
                       <option key={type} value={type}>
-                        {type}
+                        {typeName(type)}
                       </option>
                     ))}
                   </select>
@@ -1258,7 +1410,7 @@ export default function App() {
                   <input
                     id="filter-search"
                     type="text"
-                    placeholder="Booking ID or guest ID..."
+                    placeholder="Booking ID, guest or room..."
                     value={filters.q}
                     onChange={(event) =>
                       setFilters({ ...filters, q: event.target.value })
@@ -1273,24 +1425,46 @@ export default function App() {
                   <thead>
                     <tr>
                       <th>BOOKING ID</th>
-                      <th>GUEST ID</th>
-                      <th>ROOM TYPE</th>
+                      <th>{role === "guest" ? "GUESTS" : "GUEST"}</th>
+                      <th>ROOM</th>
                       <th>CHECK-IN</th>
                       <th>CHECK-OUT</th>
                       <th>NIGHTS</th>
                       <th>TOTAL</th>
                       <th>STATUS</th>
+                      {role !== "guest" && (
+                        <>
+                          <th>CHECK-IN TIME</th>
+                          <th>CHECK-OUT TIME</th>
+                          <th>STAY</th>
+                        </>
+                      )}
                       <th>ACTIONS</th>
                     </tr>
                   </thead>
                   <tbody>
                     {visibleReservations.map((reservation) => (
                       <tr key={reservation.reservationNo}>
-                        <td>{reservation.reservationNo}</td>
-                        <td title={reservation.guestId}>
-                          {String(reservation.guestId).slice(0, 8)}…
+                        <td>
+                          <button
+                            type="button"
+                            className="link-button"
+                            onClick={() => setDetailsFor(reservation)}
+                          >
+                            {reservation.reservationNo}
+                          </button>
                         </td>
-                        <td>{reservation.roomTypeId}</td>
+                        <td title={reservation.guestId}>
+                          {role === "guest"
+                            ? reservation.guests || "—"
+                            : guestLabel(reservation.guestId)}
+                        </td>
+                        <td>
+                          {typeName(reservation.roomTypeId)}
+                          {reservation.roomNumber && (
+                            <div className="muted">Room {reservation.roomNumber}</div>
+                          )}
+                        </td>
                         <td>{day(reservation.checkIn)}</td>
                         <td>{day(reservation.checkOut)}</td>
                         <td>
@@ -1301,9 +1475,22 @@ export default function App() {
                         </td>
                         <td>
                           <span className={`status-pill ${reservation.status}`}>
-                            {reservation.status}
+                            {STATUS_LABELS[reservation.status] || reservation.status}
                           </span>
                         </td>
+                        {role !== "guest" && (
+                          <>
+                            <td>{dateTime(reservation.checkedInAt)}</td>
+                            <td>{dateTime(reservation.checkedOutAt)}</td>
+                            <td>
+                              <StayButton
+                                reservation={reservation}
+                                busy={busy}
+                                onAction={(action) => stayAction(reservation, action)}
+                              />
+                            </td>
+                          </>
+                        )}
                         <td className="actions-cell">
                           <button
                             type="button"
@@ -1327,7 +1514,12 @@ export default function App() {
                               <button
                                 type="button"
                                 role="menuitem"
-                                disabled={reservation.status !== "confirmed"}
+                                disabled={!canModify(reservation, role)}
+                                title={
+                                  role === "guest" && reservation.status === "confirmed"
+                                    ? "Confirmed bookings can be changed by the front desk"
+                                    : undefined
+                                }
                                 onClick={() => startModify(reservation)}
                               >
                                 Modify
@@ -1335,7 +1527,12 @@ export default function App() {
                               <button
                                 type="button"
                                 role="menuitem"
-                                disabled={reservation.status !== "confirmed"}
+                                disabled={!canCancel(reservation, role)}
+                                title={
+                                  role === "guest" && reservation.status === "confirmed"
+                                    ? "Confirmed bookings can be cancelled by the front desk"
+                                    : undefined
+                                }
                                 onClick={() =>
                                   cancelReservation(reservation.reservationNo)
                                 }
@@ -1349,7 +1546,7 @@ export default function App() {
                     ))}
                     {visibleReservations.length === 0 && (
                       <tr>
-                        <td colSpan="9" className="empty-cell">No reservations found.</td>
+                        <td colSpan={role === "guest" ? 9 : 12} className="empty-cell">No reservations found.</td>
                       </tr>
                     )}
                   </tbody>
@@ -1366,114 +1563,11 @@ export default function App() {
           </>
         )}
 
-        {activeView === "guests" && (
-          <section aria-labelledby="guests-heading" className="register-panel">
-            <div className="register-header">
-              <h2 id="guests-heading">Find a guest</h2>
-            </div>
-            <form onSubmit={searchGuests} className="form-grid">
-              <label>
-                Name, email or phone
-                <input
-                  required
-                  value={guestQuery}
-                  onChange={(event) => setGuestQuery(event.target.value)}
-                />
-              </label>
-              <button disabled={busy} type="submit" className="primary-action">
-                Search guests
-              </button>
-            </form>
-
-            {guests.length > 0 && (
-              <div className="table-wrap">
-                <table aria-label="Guest results">
-                  <thead>
-                    <tr>
-                      <th>NAME</th>
-                      <th>EMAIL</th>
-                      <th>PHONE</th>
-                      <th>GUEST ID</th>
-                      <th>ACTIONS</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {guests.map((item) => (
-                      <tr key={item.id}>
-                        <td>
-                          {item.firstName} {item.lastName}
-                        </td>
-                        <td>{item.email}</td>
-                        <td>{item.phone || "—"}</td>
-                        <td>{item.id}</td>
-                        <td>
-                          <button
-                            type="button"
-                            className="page-btn"
-                            onClick={() => showGuest(item)}
-                          >
-                            View stays
-                          </button>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-
-            {selectedGuest && (
-              <>
-                <h3>
-                  Stay history: {selectedGuest.firstName}{" "}
-                  {selectedGuest.lastName}
-                </h3>
-                {selectedGuest.address && (
-                  <p className="muted">{selectedGuest.address}</p>
-                )}
-                <div className="lookup-actions">
-                  <button
-                    type="button"
-                    className="page-btn"
-                    onClick={() => exportGuest(selectedGuest.id)}
-                  >
-                    Export profile
-                  </button>
-                  {role === "manager" && (
-                    <button
-                      type="button"
-                      className="page-btn"
-                      onClick={() => deleteGuest(selectedGuest.id)}
-                    >
-                      Delete profile
-                    </button>
-                  )}
-                </div>
-                {guestReservations.length === 0 ? (
-                  <p>No reservations for this guest.</p>
-                ) : (
-                  <ul aria-label="Stay history" className="room-list">
-                    {guestReservations.map((reservation) => (
-                      <li key={reservation.reservationNo}>
-                        <span>
-                          {reservation.reservationNo} · {reservation.roomTypeId}
-                          {" · "}
-                          {day(reservation.checkIn)} to{" "}
-                          {day(reservation.checkOut)}
-                        </span>
-                        <span className={`status-pill ${reservation.status}`}>
-                          {reservation.status}
-                        </span>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </>
-            )}
-          </section>
-        )}
+        {activeView === "guests" && <GuestsScreen role={role} typeName={typeName} />}
 
         {activeView === "payments" && <PaymentsScreen session={session} />}
+
+        {activeView === "rooms" && <RoomManagementScreen />}
 
         {activeView === "profile" && <MyProfileScreen session={session} />}
       </div>
