@@ -98,6 +98,10 @@ export function createApp({ db = pool } = {}) {
     }
 
     const guest = built.guest;
+    if (req.headers['x-user-role'] !== 'manager') {
+      guest.loyaltyTier = 'none';
+      guest.loyaltyNumber = null;
+    }
     let client;
 
     try {
@@ -108,7 +112,6 @@ export function createApp({ db = pool } = {}) {
         [guest.email, guest.phone ?? '']
       );
 
-      const passwordHash = await bcrypt.hash(password, 10);
       const found = await client.query(
         `SELECT ${guestFields}, password_hash AS "passwordHash"
          FROM guests
@@ -119,20 +122,21 @@ export function createApp({ db = pool } = {}) {
       );
 
       if (found.rowCount) {
-        const updated = await client.query(
-          `UPDATE guests
-           SET first_name = $2, last_name = $3, phone = $4, address = $5,
-               id_document = $6, preferences = $7, loyalty_tier = $8,
-               loyalty_number = $9, consent_at = COALESCE($10::timestamptz, consent_at),
-               password_hash = $11, updated_at = NOW()
-           WHERE id = $1
-           RETURNING id AS "guestId", ${guestFields}`,
-          [found.rows[0].id, guest.firstName, guest.lastName, guest.phone, guest.address, guest.idDocument, guest.preferences, guest.loyaltyTier, guest.loyaltyNumber, guest.consentAt, passwordHash]
+        if (found.rows[0].passwordHash !== null) {
+          await client.query('ROLLBACK');
+          return res.status(409).json({ error: 'Conflict' });
+        }
+
+        const passwordHash = await bcrypt.hash(password, 10);
+        await client.query(
+          `UPDATE guests SET password_hash = $2 WHERE id = $1`,
+          [found.rows[0].id, passwordHash]
         );
         await client.query('COMMIT');
-        return res.status(200).json(updated.rows[0]);
+        return res.status(200).json({ guestId: found.rows[0].id });
       }
 
+      const passwordHash = await bcrypt.hash(password, 10);
       const created = await client.query(
         `INSERT INTO guests (
            id, email, first_name, last_name, phone, address, id_document,
@@ -193,6 +197,10 @@ export function createApp({ db = pool } = {}) {
     const actor = actorFromRequest(req);
 
     const guest = built.guest;
+    if (actor.role !== 'manager') {
+      guest.loyaltyTier = 'none';
+      guest.loyaltyNumber = null;
+    }
     let client;
 
     try {

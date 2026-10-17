@@ -71,9 +71,9 @@ Quick check: `curl http://localhost:3010/health` should return `{"status":"ok"}`
 
 ## Authentication (dev only)
 
-The gateway validates JWTs and enforces roles (`guest`, `agent`, `manager`). The web app now opens on a login screen with credential sign-in and a guest account creation form. Guest registration goes through `POST /auth/register`; sign-in uses `POST /login {"username","password"}`.
+The gateway validates JWTs and enforces roles (`guest`, `agent`, `manager`). Guest registration goes through `POST /auth/register`; sign-in uses `POST /login {"username","password"}`. Registration does not verify email ownership. A person who knows the email on a booking-only profile can set its initial password; production deployments should require a verified email or one-time claim code before enabling registration.
 
-The legacy role-based `POST /login {"role":"agent"}` path is only available when `ALLOW_DEV_LOGIN=true`. That flag now defaults to `false` in code, so it must be set explicitly for demos and tests that still use the dev route. Demo accounts are available when `ALLOW_DEV_LOGIN=true` or when `NODE_ENV` is not `production`:
+The legacy role-based `POST /login {"role":"agent"}` path is only available when `ALLOW_DEV_LOGIN=true`. It defaults to `false` in Docker Compose; enable it only for a local demo by putting `ALLOW_DEV_LOGIN=true` in the root `.env` and recreating the gateway (`docker compose up -d --force-recreate gateway`). Tests that use the role-only login set the flag explicitly. Demo staff accounts are available when `NODE_ENV` is not `production` (or when dev login is enabled):
 
 | Username | Password | Role |
 |---|---|---|
@@ -89,8 +89,43 @@ Environment variables you may want to set:
 | `VITE_DEV_ROLE_SWITCH` | Enables the dev-only role selector in the web app when set to `true` |
 | `INTERNAL_TOKEN` | Shared secret required by internal service-to-service calls |
 | `CANCELLATION_POLICY` | `full`, `partial`, or `none` reservation cancellation policy |
+| `NOTIFICATION_CHANNEL` | Default notification channel for reservation and payment-review messages (`email` or `sms`) |
 | `PAYMENT_MODE` | Billing demo mode (`decline` forces a declined deposit) |
 | `VITE_API_BASE_URL` | Optional override for the gateway URL used by the web app |
+
+## Role permissions
+
+`GET /availability`, `GET /hotels`, guest registration, and login are public.
+The gateway applies the following permissions to authenticated routes:
+
+| Route group | Guest | Agent | Manager |
+|---|---|---|---|
+| `GET /reservations` | Own reservations only; the gateway forces the guest filter | List/filter reservations | List/filter reservations |
+| `POST /reservations`, `GET/PUT/DELETE /reservations/{no}` | Create and manage own reservations only | All reservations | All reservations |
+| Reservation payment summary and cancellation quote | Own reservation only | All reservations | All reservations |
+| `POST/GET /payments/proofs`, `GET /payments/proofs/{id}/file` | Upload and view own proofs/files | View all proofs/files | View all proofs/files |
+| `PUT /payments/proofs/{id}/review` | Forbidden | Approve or reject | Approve or reject |
+| `POST /guests/get-or-create` | Create or retrieve a profile; loyalty tier is forced to `none` | Create or retrieve; loyalty tier is forced to `none` | Create or retrieve and set loyalty tier |
+| Guest profile read/update and `GET /guests/search` | Own profile only; cannot change loyalty tier | Guest records; cannot change loyalty tier | Guest records and loyalty tier management |
+| `GET /guests/{id}/export` | Forbidden | Export guest records | Export guest records |
+| `DELETE /guests/{id}` | Forbidden | Forbidden | Delete guest records |
+| Cancel with `waiveFee=true` | Forbidden | Forbidden | Allowed |
+
+Ownership is checked against the authenticated guest ID. User-supplied guest
+filters cannot expand a guest's reservation list.
+
+## Payments
+
+Guests upload proofs with `POST /payments/proofs`, including the reservation
+number, amount, currency, and a multipart file. The reservation must belong to
+the authenticated guest. Supported files are PNG, JPEG, and PDF, limited to
+5 MB; both the declared MIME type and file signature must match. New proofs have
+`pending` status. Agents and managers can approve or reject pending proofs;
+rejections require a note. The guest can list their proofs and download their
+own files. Approved proof amounts are reflected in the reservation payment
+summary as a lower `balanceDue`. Approval and rejection notifications use
+`NOTIFICATION_CHANNEL` and are best-effort; a notification outage does not
+undo or fail the review.
 
 ## Day-to-day commands
 
@@ -123,10 +158,15 @@ Notes:
 
 Use fresh dates each time, because a confirmed booking uses up a room.
 
-1. **Successful booking.** Book in the UI. Expect "Booking confirmed", and an email line in `docker compose logs notification`.
-2. **Declined deposit.** Add `PAYMENT_MODE: decline` under `billing.environment` in `docker-compose.yml`, run `docker compose up -d --force-recreate billing`, and book. Expect a "deposit declined" error. Search the same dates: availability is unchanged. Check `select id, status from holds` in `room_rate_db`: the hold is `released`. **Remove the variable and recreate billing afterwards.**
-3. **Login flow.** Open the web app, sign in as `agent` / `agent123`, and confirm the sidebar shows the signed-in name and role. Use the logout button to return to the login screen. Create a guest account with the guest form and confirm you land in the guest session.
-4. **Notification down.** `docker compose stop notification`, then book (still confirmed). In the RabbitMQ UI (http://localhost:15672, Queues) the `ReservationConfirmed` queue shows Ready = 1. Run `docker compose start notification`: the queue drops to 0 and the email is logged.
+1. **Guest registration and booking.** Register a guest with an email and password, sign in, and book. Expect "Booking confirmed" and a notification line in `docker compose logs notification`.
+2. **Guest payment proof.** As the guest, upload a PNG, JPEG, or PDF proof (up to 5 MB) for an owned reservation. Confirm it appears as `pending`.
+3. **Agent approval.** Sign in as `agent` / `agent123`, approve the proof, and verify the reservation payment summary reports the approved amount and a reduced `balanceDue`.
+4. **Agent rejection.** Reject a pending proof with a note and confirm the proof is `rejected` with the note recorded.
+5. **Manager cancellation waiver.** Sign in as `manager` / `manager123` and cancel a reservation with `waiveFee=true`; confirm the fee is waived.
+6. **Guest data isolation.** Sign in as a guest and try to list or view another guest's reservations, payment summary, cancellation quote, proof, or guest profile. The gateway must deny access or return only the signed-in guest's data.
+7. **Successful booking notification.** Book in the UI and confirm a notification line in `docker compose logs notification`.
+8. **Declined deposit.** Add `PAYMENT_MODE: decline` under `billing.environment` in `docker-compose.yml`, run `docker compose up -d --force-recreate billing`, and book. Expect a "deposit declined" error. Search the same dates: availability is unchanged. Check `select id, status from holds` in `room_rate_db`: the hold is `released`. **Remove the variable and recreate billing afterwards.**
+9. **Notification down.** `docker compose stop notification`, then book (still confirmed). In the RabbitMQ UI (http://localhost:15672, Queues) the `ReservationConfirmed` queue shows Ready = 1. Run `docker compose start notification`: the queue drops to 0 and the notification is logged.
 
 Also verify cancel (refund row in `payment_db`, room available again) and modify (new dates, recalculated total, 409 when no rooms are free).
 

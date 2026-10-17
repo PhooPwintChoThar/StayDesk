@@ -7,6 +7,102 @@ info:
     Each service uses its own base URL.
 
 paths:
+  /login:
+    post:
+      operationId: login
+      tags: [gateway]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username:
+                  type: string
+                  description: Staff username or guest email
+                password:
+                  type: string
+                  format: password
+      responses:
+        "200":
+          description: JWT issued
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [token]
+                properties:
+                  token:
+                    type: string
+        "401":
+          description: Invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /auth/register:
+    post:
+      operationId: registerGuest
+      tags: [guest]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GuestRegistrationInput"
+      responses:
+        "201":
+          description: Guest account created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [guestId]
+                properties:
+                  guestId:
+                    type: string
+        "200":
+          description: Password set for an existing booking profile without changing the profile
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [guestId]
+                properties:
+                  guestId:
+                    type: string
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /hotels:
+    get:
+      operationId: listHotels
+      tags: [room-rate]
+      responses:
+        "200":
+          description: Available hotels
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [hotels]
+                properties:
+                  hotels:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, name]
+                      properties:
+                        id:
+                          type: string
+                        name:
+                          type: string
+
   /availability:
     get:
       operationId: getAvailability
@@ -28,6 +124,15 @@ paths:
           in: query
           schema:
             type: string
+        - name: hotelId
+          in: query
+          schema:
+            type: string
+        - name: guests
+          in: query
+          schema:
+            type: integer
+            minimum: 1
         - name: excludeHoldId
           in: query
           description: Optional hold id to exclude from availability counts during a modify flow.
@@ -266,6 +371,43 @@ paths:
           $ref: "#/components/responses/NotFound"
 
   /reservations:
+    get:
+      operationId: listReservations
+      tags: [reservation]
+      description: Guest requests are always filtered to the authenticated guest, regardless of supplied guest filters.
+      parameters:
+        - name: guestId
+          in: query
+          description: Staff-only filter; ignored and replaced for guests.
+          schema:
+            type: string
+        - name: status
+          in: query
+          schema:
+            type: string
+        - name: from
+          in: query
+          schema:
+            type: string
+            format: date
+        - name: to
+          in: query
+          schema:
+            type: string
+            format: date
+      responses:
+        "200":
+          description: Reservations visible to the caller
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [reservations]
+                properties:
+                  reservations:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Reservation"
     post:
       operationId: createReservation
       tags: [reservation]
@@ -288,6 +430,9 @@ paths:
                 checkOut:
                   type: string
                   format: date
+                guests:
+                  type: integer
+                  minimum: 1
       responses:
         "201":
           description: Reservation created
@@ -344,6 +489,9 @@ paths:
                 checkOut:
                   type: string
                   format: date
+                guests:
+                  type: integer
+                  minimum: 1
       responses:
         "200":
           description: Reservation updated
@@ -357,9 +505,72 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+    delete:
+      operationId: cancelReservation
+      tags: [reservation]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                waiveFee:
+                  type: boolean
+                  description: Manager-only cancellation fee waiver.
+      responses:
+        "204":
+          description: Reservation cancelled
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /reservations/{no}/payment-summary:
+    get:
+      operationId: getReservationPaymentSummary
+      tags: [reservation]
+      parameters:
+        - name: no
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Deposit and approved-proof balance summary
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [totalAmount, depositHeld, approvedProofsTotal, balanceDue, currency]
+                properties:
+                  totalAmount:
+                    type: number
+                  depositHeld:
+                    type: number
+                  approvedProofsTotal:
+                    type: number
+                  balanceDue:
+                    type: number
+                  currency:
+                    type: string
+                    pattern: "^[A-Z]{3}$"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /reservations/{no}/cancellation-quote:
     get:
       operationId: getReservationCancellationQuote
       tags: [reservation]
+      parameters:
+        - name: no
+          in: path
+          required: true
+          schema:
+            type: string
       responses:
         "200":
           description: Quote for cancelling the reservation
@@ -380,14 +591,156 @@ paths:
                     type: string
                   hoursBeforeCheckIn:
                     type: integer
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
-    delete:
-      operationId: cancelReservation
-      tags: [reservation]
+
+  /payments/proofs:
+    post:
+      operationId: uploadPaymentProof
+      tags: [billing]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [reservationNo, amount, currency, file]
+              properties:
+                reservationNo:
+                  type: string
+                amount:
+                  type: number
+                  exclusiveMinimum: 0
+                currency:
+                  type: string
+                  pattern: "^[A-Z]{3}$"
+                note:
+                  type: string
+                file:
+                  type: string
+                  format: binary
       responses:
-        "204":
-          description: Reservation cancelled
+        "201":
+          description: Proof received for review
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, status]
+                properties:
+                  id:
+                    type: string
+                  status:
+                    type: string
+                    enum: [pending]
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "413":
+          description: File exceeds 5 MB
+    get:
+      operationId: listPaymentProofs
+      tags: [billing]
+      parameters:
+        - name: reservationNo
+          in: query
+          schema:
+            type: string
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, approved, rejected]
+      responses:
+        "200":
+          description: Payment proofs visible to the caller
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [proofs]
+                properties:
+                  proofs:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/PaymentProof"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /payments/proofs/{id}/file:
+    get:
+      operationId: getPaymentProofFile
+      tags: [billing]
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      responses:
+        "200":
+          description: Original PNG, JPEG, or PDF proof file
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+          content:
+            image/png:
+              schema:
+                type: string
+                format: binary
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /payments/proofs/{id}/review:
+    put:
+      operationId: reviewPaymentProof
+      tags: [billing]
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision]
+              properties:
+                decision:
+                  type: string
+                  enum: [approved, rejected]
+                note:
+                  type: string
+      responses:
+        "200":
+          description: Proof reviewed
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [proof]
+                properties:
+                  proof:
+                    $ref: "#/components/schemas/PaymentProof"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
@@ -452,6 +805,29 @@ components:
           type: string
         phone:
           type: string
+        address:
+          type: string
+        idDocument:
+          type: string
+        preferences:
+          type: string
+        loyaltyTier:
+          type: string
+          enum: [none, member, silver, gold, platinum]
+        loyaltyNumber:
+          type: string
+        consent:
+          type: boolean
+
+    GuestRegistrationInput:
+      allOf:
+        - $ref: "#/components/schemas/GuestInput"
+        - type: object
+          required: [password]
+          properties:
+            password:
+              type: string
+              minLength: 8
 
     Guest:
       allOf:
@@ -492,6 +868,45 @@ components:
         currency:
           type: string
 
+    PaymentProof:
+      type: object
+      required: [id, reservationNo, guestId, amount, currency, fileName, fileType, fileSize, status, createdAt]
+      properties:
+        id:
+          type: string
+        reservationNo:
+          type: string
+        guestId:
+          type: string
+        amount:
+          type: number
+        currency:
+          type: string
+          pattern: "^[A-Z]{3}$"
+        note:
+          type: [string, "null"]
+        fileName:
+          type: string
+        fileType:
+          type: string
+          enum: [image/png, image/jpeg, application/pdf]
+        fileSize:
+          type: integer
+          maximum: 5242880
+        status:
+          type: string
+          enum: [pending, approved, rejected]
+        reviewedBy:
+          type: [string, "null"]
+        reviewedAt:
+          type: [string, "null"]
+          format: date-time
+        reviewNote:
+          type: [string, "null"]
+        createdAt:
+          type: string
+          format: date-time
+
     Reservation:
       type: object
       required: [reservationNo, guestId, roomTypeId, checkIn, checkOut, totalAmount, depositAmount, depositHeld, currency, status]
@@ -508,6 +923,9 @@ components:
         checkOut:
           type: string
           format: date
+        guests:
+          type: integer
+          minimum: 1
         totalAmount:
           type: number
         depositAmount:
@@ -531,6 +949,18 @@ components:
           type: string
 
   responses:
+    Unauthorized:
+      description: User identity or credentials are missing or invalid
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Forbidden:
+      description: The caller does not have permission to access this resource
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
     BadRequest:
       description: Invalid request
       content:

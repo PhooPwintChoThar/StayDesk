@@ -1,6 +1,15 @@
 // Strategy + Factory Method: confirmation can go out as email or SMS (FR confirmation channel).
 
 export function confirmationText(payload) {
+  if (payload.event === 'PaymentProofReviewed') {
+    const lines = [
+      `Payment proof ${payload.status}: ${payload.reservationNo}`,
+      `Amount: ${payload.amount} ${payload.currency}`,
+    ];
+    if (payload.reviewNote) lines.push(`Note: ${payload.reviewNote}`);
+    return lines.join('\n');
+  }
+
   const label = payload.event === 'ReservationModified'
     ? 'Reservation modified'
     : payload.event === 'ReservationCancelled'
@@ -30,7 +39,9 @@ export function createNotifier({
     async notify(payload, { to } = {}) {
       await mailer.sendEmail({
         to: payload.guestEmail || to || process.env.NOTIFICATION_TEST_EMAIL || "test@example.com",
-        subject: `${payload.event === 'ReservationModified' ? 'Reservation modified' : payload.event === 'ReservationCancelled' ? 'Reservation cancelled' : 'Reservation confirmed'}: ${payload.reservationNo}`,
+        subject: payload.event === 'PaymentProofReviewed'
+          ? `Payment proof ${payload.status}: ${payload.reservationNo}`
+          : `${payload.event === 'ReservationModified' ? 'Reservation modified' : payload.event === 'ReservationCancelled' ? 'Reservation cancelled' : 'Reservation confirmed'}: ${payload.reservationNo}`,
         text: confirmationText(payload),
       });
     },
@@ -41,7 +52,9 @@ export function createNotifier({
     async notify(payload, { to } = {}) {
       await sms.sendSms({
         to: payload.guestPhone || to || process.env.NOTIFICATION_TEST_PHONE || "0000000000",
-        text: `${payload.event === 'ReservationModified' ? 'Reservation modified' : payload.event === 'ReservationCancelled' ? 'Reservation cancelled' : 'Reservation confirmed'}: ${payload.reservationNo}`,
+        text: payload.event === 'PaymentProofReviewed'
+          ? confirmationText(payload)
+          : `${payload.event === 'ReservationModified' ? 'Reservation modified' : payload.event === 'ReservationCancelled' ? 'Reservation cancelled' : 'Reservation confirmed'}: ${payload.reservationNo}`,
       });
     },
   };

@@ -39,9 +39,12 @@ export function allowedForGuest(method, path) {
   return (
     (method === "GET" && path === "/availability") ||
     (method === "GET" && path === "/hotels") ||
+    (method === "GET" && path === "/reservations") ||
     (method === "POST" && path === "/reservations") ||
     (["GET", "PUT", "DELETE"].includes(method) &&
       /^\/reservations\/[^/]+$/.test(path)) ||
+    (method === "GET" &&
+      /^\/reservations\/[^/]+\/(payment-summary|cancellation-quote)$/.test(path)) ||
     (method === "POST" && path === "/guests/get-or-create") ||
     (method === "GET" && /^\/guests\/[^/]+$/.test(path)) ||
     (method === "PUT" && /^\/guests\/[^/]+$/.test(path)) ||
@@ -52,7 +55,12 @@ export function allowedForGuest(method, path) {
 }
 
 export function isOwnershipRoute(path) {
-  return /^\/(reservations|guests)\/[^/]+$/.test(path);
+  return /^\/reservations\/[^/]+(?:\/(payment-summary|cancellation-quote))?$/.test(path) ||
+    /^\/guests\/[^/]+$/.test(path);
+}
+
+function userIdForClaims(ctx) {
+  return ctx.role === "guest" ? ctx.claims?.guestId : ctx.claims?.sub;
 }
 
 function bearerToken(req) {
@@ -116,6 +124,13 @@ export class AuthorizeHandler extends Handler {
     if (role === "guest" && !allowedForGuest(req.method, req.path)) {
       return res.status(403).json({ error: "Forbidden" });
     }
+    if (
+      req.method === "DELETE" &&
+      /^\/guests\/[^/]+$/.test(req.path) &&
+      role !== "manager"
+    ) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
 
     ctx.service = service;
     return super.handle(ctx);
@@ -133,23 +148,34 @@ export class RouteHandler extends Handler {
     const [envName, fallback] = service;
     const baseUrl = (process.env[envName] || fallback).replace(/\/$/, "");
     const isProofUpload = req.method === "POST" && req.path === "/payments/proofs" && req.headers["content-type"]?.includes("multipart/form-data");
+    const target = new URL(req.originalUrl, "http://gateway.local");
 
-    if (ctx.role === "guest" && ctx.claims?.guestId && isOwnershipRoute(req.path)) {
+    if (ctx.role === "guest" && isOwnershipRoute(req.path)) {
+      if (!ctx.claims?.guestId) {
+        return res.status(403).json({ error: "Forbidden" });
+      }
       const owns = await this.isOwner(ctx, baseUrl);
       if (!owns) {
         return res.status(403).json({ error: "Forbidden" });
       }
     }
 
+    if (ctx.role === "guest" && req.method === "GET" && req.path === "/reservations") {
+      for (const key of [...target.searchParams.keys()]) {
+        if (key.toLowerCase().startsWith("guest")) target.searchParams.delete(key);
+      }
+      target.searchParams.set("guestId", ctx.claims.guestId);
+    }
+
     try {
       const response = await this.http.request({
         method: req.method,
-        url: `${baseUrl}${req.originalUrl}`,
+        url: `${baseUrl}${target.pathname}${target.search}`,
         data: isProofUpload ? req : req.body,
         headers: {
           "content-type": req.headers["content-type"] || "application/json",
           ...(isProofUpload && req.headers["content-length"] ? { "content-length": req.headers["content-length"] } : {}),
-          ...(ctx.claims?.sub || ctx.claims?.guestId ? { "x-user-id": ctx.claims.sub || ctx.claims.guestId } : {}),
+          ...(userIdForClaims(ctx) ? { "x-user-id": userIdForClaims(ctx) } : {}),
           ...(ctx.role ? { "x-user-role": ctx.role } : {}),
           ...(process.env.INTERNAL_TOKEN ? { "x-internal-token": process.env.INTERNAL_TOKEN } : {}),
           ...(req.headers["x-request-id"]
@@ -170,12 +196,13 @@ export class RouteHandler extends Handler {
   async isOwner(ctx, baseUrl) {
     const { req } = ctx;
     if (req.path.startsWith("/reservations/")) {
+      const reservationPath = req.path.replace(/\/(?:payment-summary|cancellation-quote)$/, "");
       const response = await this.http.request({
         method: "GET",
-        url: `${baseUrl}${req.originalUrl}`,
+        url: `${baseUrl}${reservationPath}`,
         headers: {
           ...(process.env.INTERNAL_TOKEN ? { "x-internal-token": process.env.INTERNAL_TOKEN } : {}),
-          ...(ctx.claims?.sub || ctx.claims?.guestId ? { "x-user-id": ctx.claims.sub || ctx.claims.guestId } : {}),
+          ...(userIdForClaims(ctx) ? { "x-user-id": userIdForClaims(ctx) } : {}),
           ...(ctx.role ? { "x-user-role": ctx.role } : {}),
         },
         validateStatus: () => true,

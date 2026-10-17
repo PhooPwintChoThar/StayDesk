@@ -1,4 +1,10 @@
-import { handleReservationConfirmed, startConsumer, QUEUE_NAME } from '../consumer.js';
+import {
+  handleNotification,
+  handleReservationConfirmed,
+  startConsumer,
+  QUEUE_NAME,
+  QUEUE_NAMES
+} from '../consumer.js';
 import { jest } from '@jest/globals';
 
 const event = {
@@ -37,6 +43,55 @@ describe('ReservationConfirmed consumer', () => {
       text: 'Reservation confirmed: R-10001'
     }));
     expect(notifier.sendEmail).not.toHaveBeenCalled();
+  });
+
+  it('prefers the notificationChannel event field when selecting a channel', async () => {
+    const notifier = {
+      sendEmail: jest.fn(),
+      sendSms: jest.fn().mockResolvedValue(undefined)
+    };
+
+    await handleReservationConfirmed({ ...event, notificationChannel: 'sms' }, notifier);
+
+    expect(notifier.sendSms).toHaveBeenCalled();
+    expect(notifier.sendEmail).not.toHaveBeenCalled();
+  });
+
+  it('notifies guests when a payment proof is approved or rejected', async () => {
+    const notifier = {
+      sendEmail: jest.fn().mockResolvedValue(undefined),
+      sendSms: jest.fn().mockResolvedValue(undefined)
+    };
+    const approved = {
+      event: 'PaymentProofReviewed',
+      reservationNo: 'R-10001',
+      guestId: 'guest-123',
+      guestEmail: 'guest@example.com',
+      amount: 42.5,
+      currency: 'USD',
+      status: 'approved',
+      notificationChannel: 'email'
+    };
+    const rejected = {
+      ...approved,
+      status: 'rejected',
+      reviewNote: 'Receipt is unreadable.',
+      notificationChannel: 'sms'
+    };
+
+    await handleNotification(approved, notifier);
+    await handleNotification(rejected, notifier);
+
+    expect(QUEUE_NAMES).toContain('PaymentProofReviewed');
+    expect(notifier.sendEmail).toHaveBeenCalledWith(expect.objectContaining({
+      to: 'guest@example.com',
+      subject: 'Payment proof approved: R-10001',
+      text: expect.stringContaining('Amount: 42.5 USD')
+    }));
+    expect(notifier.sendSms).toHaveBeenCalledWith(expect.objectContaining({
+      text: expect.stringContaining('Payment proof rejected: R-10001')
+    }));
+    expect(notifier.sendSms.mock.calls[0][0].text).toContain('Note: Receipt is unreadable.');
   });
 
   it('rejects malformed event payloads', async () => {

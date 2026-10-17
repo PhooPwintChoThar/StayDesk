@@ -33,7 +33,7 @@ services:
     environment:
       PORT: 3000
       JWT_SECRET: ${JWT_SECRET:-dev-secret-change-me}
-      ALLOW_DEV_LOGIN: "true"
+      ALLOW_DEV_LOGIN: ${ALLOW_DEV_LOGIN:-false}
       GUEST_SERVICE_URL: http://guest:3000
       RESERVATION_SERVICE_URL: http://reservation:3000
       ROOM_RATE_SERVICE_URL: http://room-rate:3000
@@ -97,6 +97,7 @@ services:
       PORT: 3000
       DATABASE_URL: "postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/payment_db"
       RABBITMQ_URL: amqp://rabbitmq:5672
+      NOTIFICATION_CHANNEL: ${NOTIFICATION_CHANNEL:-email}
     depends_on:
       postgres:
         condition: service_healthy
@@ -111,6 +112,7 @@ services:
       PORT: 3000
       DATABASE_URL: "postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/notification_db"
       RABBITMQ_URL: amqp://rabbitmq:5672
+      NOTIFICATION_CHANNEL: ${NOTIFICATION_CHANNEL:-email}
     depends_on:
       postgres:
         condition: service_healthy

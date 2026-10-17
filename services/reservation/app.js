@@ -225,6 +225,12 @@ async function loadApprovedProofsTotal(http, reservationNo) {
 }
 
 function notificationPayload(reservation, extra = {}) {
+  const notificationChannel =
+    reservation.notificationChannel ||
+    reservation.channel ||
+    extra.notificationChannel ||
+    extra.channel ||
+    "email";
   return {
     reservationNo: reservation.reservationNo,
     guestId: reservation.guestId,
@@ -235,7 +241,8 @@ function notificationPayload(reservation, extra = {}) {
     checkOut: reservation.checkOut,
     totalAmount: Number(reservation.totalAmount),
     currency: currencyValue(reservation),
-    channel: reservation.channel || extra.channel || "email",
+    channel: notificationChannel,
+    notificationChannel,
     confirmedAt: extra.confirmedAt || new Date().toISOString(),
     event: extra.event || "ReservationConfirmed",
   };

@@ -107,7 +107,7 @@ describe('guest endpoints', () => {
       loyaltyTier: 'gold',
       loyaltyNumber: 'GOLD-1',
       consent: true
-    });
+    }).set('x-user-role', 'manager');
 
     expect(created.status).toBe(201);
     expect(created.body).toMatchObject({
@@ -133,11 +133,14 @@ describe('guest endpoints', () => {
       email: 'auth@example.com',
       password: 'secret123',
       firstName: 'Auth',
-      lastName: 'Guest'
+      lastName: 'Guest',
+      loyaltyTier: 'gold',
+      loyaltyNumber: 'GOLD-AUTH'
     });
 
     expect(registered.status).toBe(201);
     expect(registered.body.guestId).toEqual(expect.any(String));
+    expect(registered.body).toMatchObject({ loyaltyTier: 'none', loyaltyNumber: null });
 
     const loggedIn = await request(app).post('/auth/login').send({
       email: 'auth@example.com',
@@ -149,6 +152,107 @@ describe('guest endpoints', () => {
       guestId: registered.body.guestId,
       role: 'guest'
     });
+  });
+
+  it('does not allow registration to overwrite an existing password or profile', async () => {
+    const registered = await request(app).post('/auth/register').send({
+      email: 'protected@example.com',
+      password: 'original123',
+      firstName: 'Original',
+      lastName: 'Guest'
+    });
+
+    const takeover = await request(app).post('/auth/register').send({
+      email: 'protected@example.com',
+      password: 'attacker123',
+      firstName: 'Changed',
+      lastName: 'Profile',
+      loyaltyTier: 'gold'
+    });
+
+    const login = await request(app).post('/auth/login').send({
+      email: 'protected@example.com',
+      password: 'original123'
+    });
+    const guest = await request(app).get(`/guests/${registered.body.guestId}`);
+
+    expect(takeover.status).toBe(409);
+    expect(takeover.body).toEqual({ error: 'Conflict' });
+    expect(login.status).toBe(200);
+    expect(guest.body).toMatchObject({
+      firstName: 'Original',
+      lastName: 'Guest',
+      loyaltyTier: 'none'
+    });
+  });
+
+  it('sets a password for a booking guest without changing their profile', async () => {
+    const profile = await request(app).post('/guests/get-or-create').send({
+      email: 'booking@example.com',
+      firstName: 'Booking',
+      lastName: 'Guest',
+      phone: '+66 555 1234',
+      loyaltyTier: 'gold',
+      loyaltyNumber: 'GOLD-BOOKING'
+    });
+
+    const registered = await request(app).post('/auth/register').send({
+      email: 'booking@example.com',
+      password: 'newsecret123',
+      firstName: 'Changed',
+      lastName: 'Name',
+      phone: '0000000000',
+      loyaltyTier: 'platinum'
+    });
+    const stored = await request(app).get(`/guests/${profile.body.id}`);
+    const login = await request(app).post('/auth/login').send({
+      email: 'booking@example.com',
+      password: 'newsecret123'
+    });
+
+    expect(registered.status).toBe(200);
+    expect(registered.body).toEqual({ guestId: profile.body.id });
+    expect(stored.body).toMatchObject({
+      firstName: 'Booking',
+      lastName: 'Guest',
+      phone: '+66 555 1234',
+      loyaltyTier: 'none',
+      loyaltyNumber: null
+    });
+    expect(login.status).toBe(200);
+  });
+
+  it('ignores non-manager loyalty assignment while preserving an existing tier', async () => {
+    const ignored = await request(app).post('/guests/get-or-create').send({
+      email: 'ignored-tier@example.com',
+      firstName: 'No',
+      lastName: 'Tier',
+      loyaltyTier: 'gold',
+      loyaltyNumber: 'GOLD-IGNORED'
+    });
+    const managed = await request(app).post('/guests/get-or-create')
+      .set('x-user-role', 'manager')
+      .send({
+        email: 'managed-tier@example.com',
+        firstName: 'Managed',
+        lastName: 'Tier',
+        loyaltyTier: 'gold',
+        loyaltyNumber: 'GOLD-MANAGED'
+      });
+    const unchanged = await request(app).post('/guests/get-or-create')
+      .set('x-user-role', 'agent')
+      .send({
+        email: 'managed-tier@example.com',
+        firstName: 'Changed',
+        lastName: 'Name',
+        loyaltyTier: 'platinum',
+        loyaltyNumber: 'PLATINUM-ATTEMPT'
+      });
+
+    expect(ignored.body).toMatchObject({ loyaltyTier: 'none', loyaltyNumber: null });
+    expect(managed.body).toMatchObject({ loyaltyTier: 'gold', loyaltyNumber: 'GOLD-MANAGED' });
+    expect(unchanged.status).toBe(200);
+    expect(unchanged.body).toMatchObject({ loyaltyTier: 'gold', loyaltyNumber: 'GOLD-MANAGED' });
   });
 
   it('returns 404 when updating an unknown guest', async () => {

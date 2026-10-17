@@ -10,8 +10,8 @@ const reservationUrl = 'http://reservation.test';
 const guestUrl = 'http://guest.test';
 const billingUrl = 'http://billing.test';
 
-function token(role) {
-  return jwt.sign({ role }, secret);
+function token(role, claims = {}) {
+  return jwt.sign({ ...claims, role }, secret);
 }
 
 function uniqueIp(tag) {
@@ -167,14 +167,180 @@ describe('gateway authentication and proxying', () => {
     const app = createApp({ secret });
     nock(reservationUrl)
       .get('/reservations/R-10001')
-      .reply(200, { reservationNo: 'R-10001', status: 'confirmed' });
+      .twice()
+      .reply(200, { reservationNo: 'R-10001', guestId: 'guest-123', status: 'confirmed' });
+
+    const response = await request(app)
+      .get('/reservations/R-10001')
+      .set('Authorization', `Bearer ${token('guest', { guestId: 'guest-123' })}`);
+
+    expect(response.status).toBe(200);
+    expect(response.body.reservationNo).toBe('R-10001');
+  });
+
+  it('denies guest ownership routes when the JWT has no guestId', async () => {
+    const app = createApp({ secret });
 
     const response = await request(app)
       .get('/reservations/R-10001')
       .set('Authorization', `Bearer ${token('guest')}`);
 
+    expect(response.status).toBe(403);
+  });
+
+  it('forces guest reservation lists to their own guestId and uses guestId as identity', async () => {
+    const app = createApp({ secret });
+    const upstream = nock(reservationUrl)
+      .get('/reservations')
+      .query({ guestId: 'guest-123', status: 'confirmed' })
+      .matchHeader('x-user-id', 'guest-123')
+      .reply(200, { reservations: [{ reservationNo: 'R-10001', guestId: 'guest-123' }] });
+
+    const response = await request(app)
+      .get('/reservations')
+      .query({
+        guestId: ['another-guest', 'third-guest'],
+        guestEmail: 'another@example.com',
+        guestPhone: '5550000',
+        status: 'confirmed'
+      })
+      .set('Authorization', `Bearer ${token('guest', { sub: 'guest@example.com', guestId: 'guest-123' })}`);
+
     expect(response.status).toBe(200);
-    expect(response.body.reservationNo).toBe('R-10001');
+    expect(response.body.reservations[0].guestId).toBe('guest-123');
+    expect(upstream.isDone()).toBe(true);
+  });
+
+  it.each(['agent', 'manager'])('allows %s to list reservations using the staff subject', async (role) => {
+    const app = createApp({ secret });
+    const upstream = nock(reservationUrl)
+      .get('/reservations')
+      .query({ status: 'confirmed' })
+      .matchHeader('x-user-id', `${role}-123`)
+      .reply(200, { reservations: [] });
+
+    const response = await request(app)
+      .get('/reservations?status=confirmed')
+      .set('Authorization', `Bearer ${token(role, { sub: `${role}-123` })}`);
+
+    expect(response.status).toBe(200);
+    expect(upstream.isDone()).toBe(true);
+  });
+
+  it.each([
+    ['payment-summary', { approvedAmount: 42.5, balanceDue: 107.5 }],
+    ['cancellation-quote', { refundAmount: 45, feeAmount: 0 }]
+  ])('allows an owning guest to read reservation %s', async (route, body) => {
+    const app = createApp({ secret });
+    nock(reservationUrl)
+      .get('/reservations/R-10001')
+      .matchHeader('x-user-id', 'guest-123')
+      .reply(200, { reservationNo: 'R-10001', guestId: 'guest-123' });
+    nock(reservationUrl)
+      .get(`/reservations/R-10001/${route}`)
+      .reply(200, body);
+
+    const response = await request(app)
+      .get(`/reservations/R-10001/${route}`)
+      .set('Authorization', `Bearer ${token('guest', { guestId: 'guest-123' })}`);
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual(body);
+  });
+
+  it.each([
+    ['agent', 'payment-summary'],
+    ['manager', 'payment-summary'],
+    ['agent', 'cancellation-quote'],
+    ['manager', 'cancellation-quote']
+  ])('allows %s to read a reservation %s', async (role, route) => {
+    const app = createApp({ secret });
+    const body = { reservationNo: 'R-10001' };
+    const upstream = nock(reservationUrl)
+      .get(`/reservations/R-10001/${route}`)
+      .matchHeader('x-user-id', `${role}-1`)
+      .reply(200, body);
+
+    const response = await request(app)
+      .get(`/reservations/R-10001/${route}`)
+      .set('Authorization', `Bearer ${token(role, { sub: `${role}-1` })}`);
+
+    expect(response.status).toBe(200);
+    expect(upstream.isDone()).toBe(true);
+  });
+
+  it.each([
+    ['payment-summary', { approvedAmount: 42.5 }],
+    ['cancellation-quote', { refundAmount: 45 }]
+  ])('denies a guest reading another guest reservation %s', async (route) => {
+    const app = createApp({ secret });
+    const ownershipLookup = nock(reservationUrl)
+      .get('/reservations/R-10001')
+      .reply(200, { reservationNo: 'R-10001', guestId: 'someone-else' });
+
+    const response = await request(app)
+      .get(`/reservations/R-10001/${route}`)
+      .set('Authorization', `Bearer ${token('guest', { guestId: 'guest-123' })}`);
+
+    expect(response.status).toBe(403);
+    expect(ownershipLookup.isDone()).toBe(true);
+  });
+
+  it.each([
+    ['guest', 403],
+    ['agent', 403],
+    ['manager', 204]
+  ])('applies %s permissions to guest deletion', async (role, expectedStatus) => {
+    const app = createApp({ secret });
+    if (role === 'manager') {
+      nock(guestUrl).delete('/guests/guest-123').reply(204);
+    }
+
+    const response = await request(app)
+      .delete('/guests/guest-123')
+      .set('Authorization', `Bearer ${token(role, { sub: `${role}-1`, guestId: 'guest-123' })}`);
+
+    expect(response.status).toBe(expectedStatus);
+  });
+
+  it.each([
+    ['guest', 403],
+    ['agent', 200],
+    ['manager', 200]
+  ])('applies %s permissions to guest export', async (role, expectedStatus) => {
+    const app = createApp({ secret });
+    if (role !== 'guest') {
+      nock(guestUrl)
+        .get('/guests/guest-123/export')
+        .reply(200, { guest: { id: 'guest-123' } });
+    }
+
+    const response = await request(app)
+      .get('/guests/guest-123/export')
+      .set('Authorization', `Bearer ${token(role, { sub: `${role}-1`, guestId: 'guest-123' })}`);
+
+    expect(response.status).toBe(expectedStatus);
+  });
+
+  it.each([
+    ['guest', 403],
+    ['agent', 200],
+    ['manager', 200]
+  ])('applies %s permissions to payment proof review', async (role, expectedStatus) => {
+    const app = createApp({ secret });
+    if (role !== 'guest') {
+      nock(billingUrl)
+        .put('/payments/proofs/proof-1/review', { decision: 'approved' })
+        .matchHeader('x-user-id', `${role}-1`)
+        .reply(200, { proof: { id: 'proof-1', status: 'approved' } });
+    }
+
+    const response = await request(app)
+      .put('/payments/proofs/proof-1/review')
+      .set('Authorization', `Bearer ${token(role, { sub: `${role}-1`, guestId: 'guest-123' })}`)
+      .send({ decision: 'approved' });
+
+    expect(response.status).toBe(expectedStatus);
   });
 
   it('proxies an authorized request and returns the service response', async () => {
@@ -218,5 +384,80 @@ describe('gateway authentication and proxying', () => {
     expect(response.status).toBe(201);
     expect(response.body).toMatchObject({ status: 'pending' });
     expect(upstream.isDone()).toBe(true);
+  });
+
+  it('completes a guest payment-proof flow through the gateway', async () => {
+    const app = createApp({ secret });
+    nock(guestUrl)
+      .post('/auth/login', { email: 'guest@example.com', password: 'guestpass123' })
+      .reply(200, { guestId: 'guest-123', role: 'guest' });
+    const login = await request(app)
+      .post('/login')
+      .set('X-Forwarded-For', uniqueIp('20'))
+      .send({ username: 'guest@example.com', password: 'guestpass123' });
+    expect(login.status).toBe(200);
+    const guestAuth = `Bearer ${login.body.token}`;
+
+    const reservations = nock(reservationUrl)
+      .get('/reservations')
+      .query({ guestId: 'guest-123' })
+      .matchHeader('x-user-id', 'guest-123')
+      .reply(200, { reservations: [{ reservationNo: 'R-10001', guestId: 'guest-123' }] });
+    const listed = await request(app).get('/reservations?guestId=other-guest').set('Authorization', guestAuth);
+    expect(listed.status).toBe(200);
+    expect(listed.body.reservations[0].guestId).toBe('guest-123');
+    expect(reservations.isDone()).toBe(true);
+
+    const upload = nock(billingUrl)
+      .post('/payments/proofs', (body) => {
+        const text = typeof body === 'string' ? body : Buffer.isBuffer(body) ? body.toString('utf8') : '';
+        return text.includes('R-10001') && text.includes('evidence.pdf');
+      })
+      .matchHeader('content-type', (value) => String(value).includes('multipart/form-data'))
+      .matchHeader('x-user-id', 'guest-123')
+      .reply(201, { id: 'proof-e2e', status: 'pending' });
+    const uploaded = await request(app)
+      .post('/payments/proofs')
+      .set('Authorization', guestAuth)
+      .field('reservationNo', 'R-10001')
+      .field('amount', '42.50')
+      .field('currency', 'USD')
+      .attach('file', Buffer.from('%PDF-1.4\npayment evidence'), 'evidence.pdf');
+    expect(uploaded.status).toBe(201);
+    expect(uploaded.body).toMatchObject({ id: 'proof-e2e', status: 'pending' });
+    expect(upload.isDone()).toBe(true);
+
+    const review = nock(billingUrl)
+      .put('/payments/proofs/proof-e2e/review', { decision: 'approved' })
+      .matchHeader('x-user-id', 'agent-1')
+      .reply(200, { proof: { id: 'proof-e2e', status: 'approved' } });
+    const reviewed = await request(app)
+      .put('/payments/proofs/proof-e2e/review')
+      .set('Authorization', `Bearer ${token('agent', { sub: 'agent-1' })}`)
+      .send({ decision: 'approved' });
+    expect(reviewed.status).toBe(200);
+    expect(reviewed.body.proof.status).toBe('approved');
+    expect(review.isDone()).toBe(true);
+
+    nock(reservationUrl)
+      .get('/reservations/R-10001')
+      .matchHeader('x-user-id', 'guest-123')
+      .reply(200, { reservationNo: 'R-10001', guestId: 'guest-123' });
+    const summary = nock(reservationUrl)
+      .get('/reservations/R-10001/payment-summary')
+      .reply(200, {
+        reservationNo: 'R-10001',
+        totalAmount: 200,
+        depositHeld: 60,
+        approvedProofsTotal: 42.5,
+        balanceDue: 97.5,
+        currency: 'USD'
+      });
+    const paymentSummary = await request(app)
+      .get('/reservations/R-10001/payment-summary')
+      .set('Authorization', guestAuth);
+    expect(paymentSummary.status).toBe(200);
+    expect(paymentSummary.body).toMatchObject({ approvedProofsTotal: 42.5, balanceDue: 97.5 });
+    expect(summary.isDone()).toBe(true);
   });
 });

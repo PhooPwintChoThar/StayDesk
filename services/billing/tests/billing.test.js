@@ -1,7 +1,8 @@
 import { readFile } from 'node:fs/promises';
 import nock from 'nock';
 import request from 'supertest';
-import { app } from '../app.js';
+import { jest } from '@jest/globals';
+import { app, createApp } from '../app.js';
 import { pool } from '../db.js';
 
 const depositPayload = {
@@ -96,7 +97,7 @@ describe('billing endpoints', () => {
       .field('reservationNo', 'R-10001')
       .field('amount', '42.50')
       .field('currency', 'USD')
-      .attach('file', Buffer.from('proof-bytes'), 'proof.pdf');
+      .attach('file', Buffer.from('%PDF-1.4\nproof bytes'), 'proof.pdf');
 
     expect(created.status).toBe(201);
     expect(created.body).toMatchObject({ status: 'pending' });
@@ -111,6 +112,11 @@ describe('billing endpoints', () => {
     expect(list.body.proofs).toHaveLength(1);
     expect(list.body.proofs[0]).not.toHaveProperty('file_data');
 
+    const guestReview = await request(app)
+      .put('/payments/proofs/not-a-proof/review')
+      .set('x-user-id', 'guest-123')
+      .set('x-user-role', 'guest')
+      .send({ decision: 'approved' });
     const file = await request(app)
       .get(`/payments/proofs/${created.body.id}/file`)
       .set('x-user-id', 'guest-123')
@@ -118,6 +124,8 @@ describe('billing endpoints', () => {
 
     expect(file.status).toBe(200);
     expect(file.headers['content-type']).toContain('application/pdf');
+    expect(file.headers['content-disposition']).toBe("attachment; filename*=UTF-8''proof.pdf");
+    expect(guestReview.status).toBe(403);
 
     const review = await request(app)
       .put(`/payments/proofs/${created.body.id}/review`)
@@ -144,6 +152,17 @@ describe('billing endpoints', () => {
       .field('currency', 'USD')
       .attach('file', Buffer.from('plain text'), 'proof.txt');
 
+    const spoofedType = await request(app)
+      .post('/payments/proofs')
+      .set('x-user-id', 'guest-123')
+      .set('x-user-role', 'guest')
+      .field('reservationNo', 'R-10001')
+      .field('amount', '42.50')
+      .field('currency', 'USD')
+      .attach('file', Buffer.from([0x89, 0x50, 0x4e, 0x47]), 'spoofed.pdf', {
+        contentType: 'application/pdf'
+      });
+
     const large = await request(app)
       .post('/payments/proofs')
       .set('x-user-id', 'guest-123')
@@ -154,6 +173,139 @@ describe('billing endpoints', () => {
       .attach('file', Buffer.alloc(5 * 1024 * 1024 + 1), 'proof.pdf');
 
     expect(badType.status).toBe(400);
+    expect(spoofedType.status).toBe(400);
     expect(large.status).toBe(413);
+  });
+
+  it('accepts PNG and JPEG files whose magic bytes match their MIME types', async () => {
+    process.env.RESERVATION_SERVICE_URL = 'http://reservation.test';
+    nock('http://reservation.test')
+      .get('/reservations/R-10001')
+      .twice()
+      .reply(200, { reservationNo: 'R-10001', guestId: 'guest-123' });
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]);
+    const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0x00]);
+
+    const pngUpload = await request(app)
+      .post('/payments/proofs')
+      .set('x-user-id', 'guest-123')
+      .set('x-user-role', 'guest')
+      .field('reservationNo', 'R-10001')
+      .field('amount', '10')
+      .field('currency', 'USD')
+      .attach('file', png, 'proof.png');
+    const jpegUpload = await request(app)
+      .post('/payments/proofs')
+      .set('x-user-id', 'guest-123')
+      .set('x-user-role', 'guest')
+      .field('reservationNo', 'R-10001')
+      .field('amount', '10')
+      .field('currency', 'USD')
+      .attach('file', jpeg, 'proof.jpg');
+
+    expect(pngUpload.status).toBe(201);
+    expect(jpegUpload.status).toBe(201);
+  });
+
+  it('requires an authenticated identity and limits guests to their own proof files', async () => {
+    const missingUploadIdentity = await request(app)
+      .post('/payments/proofs')
+      .set('x-user-role', 'guest')
+      .field('reservationNo', 'R-10001');
+    const missingListIdentity = await request(app)
+      .get('/payments/proofs')
+      .set('x-user-role', 'guest');
+    const missingFileIdentity = await request(app)
+      .get('/payments/proofs/00000000-0000-0000-0000-000000000001/file')
+      .set('x-user-role', 'guest');
+    const invalidRole = await request(app)
+      .get('/payments/proofs')
+      .set('x-user-id', 'guest-123')
+      .set('x-user-role', 'unknown');
+
+    expect(missingUploadIdentity.status).toBe(401);
+    expect(missingListIdentity.status).toBe(401);
+    expect(missingFileIdentity.status).toBe(401);
+    expect(invalidRole.status).toBe(403);
+
+    process.env.RESERVATION_SERVICE_URL = 'http://reservation.test';
+    nock('http://reservation.test')
+      .get('/reservations/R-OTHER')
+      .reply(200, { reservationNo: 'R-OTHER', guestId: 'guest-999' });
+    const deniedUpload = await request(app)
+      .post('/payments/proofs')
+      .set('x-user-id', 'guest-123')
+      .set('x-user-role', 'guest')
+      .field('reservationNo', 'R-OTHER')
+      .field('amount', '42.50')
+      .field('currency', 'USD')
+      .attach('file', Buffer.from('%PDF-1.4\nproof'), 'proof.pdf');
+    expect(deniedUpload.status).toBe(403);
+
+    nock('http://reservation.test')
+      .get('/reservations/R-10001')
+      .reply(200, { reservationNo: 'R-10001', guestId: 'guest-123' });
+    const created = await request(app)
+      .post('/payments/proofs')
+      .set('x-user-id', 'guest-123')
+      .set('x-user-role', 'guest')
+      .field('reservationNo', 'R-10001')
+      .field('amount', '42.50')
+      .field('currency', 'USD')
+      .attach('file', Buffer.from('%PDF-1.4\nproof'), 'proof "safe".pdf');
+    await pool.query(
+      'UPDATE payment_proofs SET file_name = $1 WHERE id = $2',
+      ['unsafe"\r\nX-Injected: 1.pdf', created.body.id]
+    );
+    const ownFile = await request(app)
+      .get(`/payments/proofs/${created.body.id}/file`)
+      .set('x-user-id', 'guest-123')
+      .set('x-user-role', 'guest');
+    const otherGuestFile = await request(app)
+      .get(`/payments/proofs/${created.body.id}/file`)
+      .set('x-user-id', 'guest-456')
+      .set('x-user-role', 'guest');
+
+    expect(created.status).toBe(201);
+    expect(ownFile.headers['content-disposition']).toBe(
+      "attachment; filename*=UTF-8''unsafe%22%0D%0AX-Injected%3A%201.pdf"
+    );
+    expect(ownFile.headers['content-disposition']).not.toMatch(/[\r\n"]/);
+    expect(otherGuestFile.status).toBe(403);
+  });
+
+  it('does not fail proof review when its notification publisher rejects', async () => {
+    const proofId = '00000000-0000-0000-0000-000000000099';
+    await pool.query(
+      `INSERT INTO payment_proofs (
+        id, reservation_no, guest_id, amount, currency, file_name, file_type,
+        file_size, file_data, status
+      ) VALUES ($1, 'R-10001', 'guest-123', 25, 'USD', 'proof.pdf',
+                'application/pdf', 8, $2, 'pending')`,
+      [proofId, Buffer.from('%PDF-1.4')]
+    );
+    const notifyProofReview = jest.fn().mockRejectedValue(new Error('notification unavailable'));
+    const log = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    const response = await request(createApp({ db: pool, notifyProofReview }))
+      .put(`/payments/proofs/${proofId}/review`)
+      .set('x-user-id', 'agent-1')
+      .set('x-user-role', 'agent')
+      .send({ decision: 'rejected', note: 'Receipt is unreadable.' });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(response.status).toBe(200);
+    expect(response.body.proof.status).toBe('rejected');
+    expect(notifyProofReview).toHaveBeenCalledWith(expect.objectContaining({
+      reservationNo: 'R-10001',
+      guestId: 'guest-123',
+      amount: 25,
+      currency: 'USD',
+      status: 'rejected',
+      reviewNote: 'Receipt is unreadable.',
+      event: 'PaymentProofReviewed'
+    }));
+    expect(log).toHaveBeenCalledWith('Failed to send payment proof review notification.');
+    log.mockRestore();
   });
 });
