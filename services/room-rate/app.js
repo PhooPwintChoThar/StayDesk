@@ -116,6 +116,185 @@ export function createApp({ db = pool, clock = () => new Date() } = {}) {
     }
   });
 
+  app.get('/rate-plans', async (_req, res, next) => {
+    try {
+      const result = await db.query(
+        `SELECT id, room_type_id AS "roomTypeId", nightly_rate AS "nightlyRate", currency, active
+         FROM rate_plans
+         ORDER BY room_type_id, nightly_rate`
+      );
+      return res.status(200).json({ ratePlans: result.rows });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  const ROOM_STATUSES = ['available', 'unavailable', 'maintenance', 'inactive'];
+
+  function isRoomStatus(value) {
+    return typeof value === 'string' && ROOM_STATUSES.includes(value);
+  }
+
+  async function findRoom(client, id) {
+    const result = await client.query(
+      'SELECT id, room_type_id AS "roomTypeId", status FROM rooms WHERE id = $1 FOR UPDATE',
+      [id]
+    );
+    if (result.rowCount === 0) return null;
+    return result.rows[0];
+  }
+
+  app.get('/rooms', async (_req, res, next) => {
+    try {
+      const result = await db.query(
+        `SELECT r.id,
+                r.room_number AS "roomNumber",
+                r.status,
+                r.hotel_id AS "hotelId",
+                h.name AS "hotelName",
+                r.room_type_id AS "roomTypeId",
+                rt.name AS "roomTypeName",
+                rt.max_occupancy AS "maxOccupancy",
+                COALESCE(rate.nightly_rate, 0)::float AS "price",
+                COALESCE(rate.currency, 'USD') AS currency
+         FROM rooms r
+         JOIN hotels h ON h.id = r.hotel_id
+         JOIN room_types rt ON rt.id = r.room_type_id
+         LEFT JOIN LATERAL (
+           SELECT nightly_rate, currency
+           FROM rate_plans
+           WHERE room_type_id = r.room_type_id AND active = TRUE
+           ORDER BY nightly_rate ASC
+           LIMIT 1
+         ) rate ON TRUE
+         ORDER BY r.room_number`
+      );
+      return res.status(200).json({ rooms: result.rows });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  app.post('/rooms', async (req, res, next) => {
+    const { hotelId, roomTypeId, roomNumber, status } = req.body ?? {};
+
+    if (!hotelId || !roomTypeId || !roomNumber) {
+      return errorResponse(res, 400, 'BadRequest', 'hotelId, roomTypeId and roomNumber are required.');
+    }
+
+    const finalStatus = status ?? 'available';
+    if (!isRoomStatus(finalStatus)) {
+      return errorResponse(
+        res,
+        400,
+        'BadRequest',
+        `status must be one of: ${ROOM_STATUSES.join(', ')}.`
+      );
+    }
+
+    const client = await db.connect();
+    try {
+      await client.query('BEGIN');
+
+      const hotel = await client.query('SELECT id FROM hotels WHERE id = $1', [hotelId]);
+      if (hotel.rowCount === 0) {
+        await client.query('ROLLBACK');
+        return errorResponse(res, 404, 'NotFound', 'Hotel not found.');
+      }
+
+      const roomType = await client.query(
+        'SELECT id, hotel_id FROM room_types WHERE id = $1',
+        [roomTypeId]
+      );
+      if (roomType.rowCount === 0) {
+        await client.query('ROLLBACK');
+        return errorResponse(res, 404, 'NotFound', 'Room type not found.');
+      }
+      if (roomType.rows[0].hotel_id !== hotelId) {
+        await client.query('ROLLBACK');
+        return errorResponse(res, 400, 'BadRequest', 'Room type does not belong to the selected hotel.');
+      }
+
+      const id = randomUUID();
+      const result = await client.query(
+        `INSERT INTO rooms (id, hotel_id, room_type_id, room_number, status)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING id, room_number AS "roomNumber", status, hotel_id AS "hotelId", room_type_id AS "roomTypeId"`,
+        [id, hotelId, roomTypeId, roomNumber, finalStatus]
+      );
+
+      await client.query('COMMIT');
+      return res.status(201).json(result.rows[0]);
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      if (error.code === '23505') {
+        return errorResponse(res, 409, 'Conflict', 'A room with this number already exists in the hotel.');
+      }
+      return next(error);
+    } finally {
+      client.release();
+    }
+  });
+
+  app.patch('/rooms/:id', async (req, res, next) => {
+    const { status } = req.body ?? {};
+
+    if (!isRoomStatus(status)) {
+      return errorResponse(
+        res,
+        400,
+        'BadRequest',
+        `status must be one of: ${ROOM_STATUSES.join(', ')}.`
+      );
+    }
+
+    const client = await db.connect();
+    try {
+      await client.query('BEGIN');
+
+      const room = await findRoom(client, req.params.id);
+      if (!room) {
+        await client.query('ROLLBACK');
+        return errorResponse(res, 404, 'NotFound', 'Room not found.');
+      }
+
+      if (status !== 'available') {
+        const today = clock().toISOString().slice(0, 10);
+        const blocking = await client.query(
+          `SELECT 1 FROM holds h
+           WHERE h.room_type_id = $1
+             AND h.status IN ('held', 'confirmed')
+             AND h.check_out > $2::date
+           LIMIT 1`,
+          [room.roomTypeId, today]
+        );
+        if (blocking.rowCount > 0) {
+          await client.query('ROLLBACK');
+          return errorResponse(
+            res,
+            409,
+            'Conflict',
+            'Cannot mark the room unavailable: it has held or confirmed reservations from today onward.'
+          );
+        }
+      }
+
+      const updated = await client.query(
+        `UPDATE rooms SET status = $1 WHERE id = $2
+         RETURNING id, room_number AS "roomNumber", status, hotel_id AS "hotelId", room_type_id AS "roomTypeId"`,
+        [status, req.params.id]
+      );
+
+      await client.query('COMMIT');
+      return res.status(200).json(updated.rows[0]);
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      return next(error);
+    } finally {
+      client.release();
+    }
+  });
+
   app.get('/availability', async (req, res, next) => {
     const { checkIn, checkOut, roomTypeId, hotelId, excludeHoldId } = req.query;
     const guests = req.query.guests === undefined || req.query.guests === ''

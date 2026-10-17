@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS rooms (
   room_type_id TEXT NOT NULL REFERENCES room_types(id),
   room_number TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'available'
-    CHECK (status IN ('available', 'maintenance', 'inactive')),
+    CHECK (status IN ('available', 'unavailable', 'maintenance', 'inactive')),
   UNIQUE (hotel_id, room_number)
 );
 
