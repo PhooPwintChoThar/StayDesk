@@ -21,12 +21,31 @@ const stored = {
   status: "confirmed",
 };
 
+function makeToken(payload) {
+  const encode = (value) =>
+    btoa(JSON.stringify(value)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  return `header.${encode(payload)}.signature`;
+}
+
 function mockApi(routes) {
   fetch.mockImplementation(async (url, options = {}) => {
     const method = options.method || "GET";
     const path = url.replace(/^https?:\/\/[^/]+/, "");
     if (path === "/login") {
-      return reply(200, { token: `token-${JSON.parse(options.body).role}` });
+      const body = JSON.parse(options.body);
+      if (body.role) {
+        return reply(200, { token: makeToken({ role: body.role, sub: body.role }) });
+      }
+      if (body.username === "agent" && body.password === "agent123") {
+        return reply(200, { token: makeToken({ sub: "agent", role: "agent" }) });
+      }
+      if (body.username === "guest@example.com" && body.password === "secret123") {
+        return reply(200, { token: makeToken({ sub: body.username, role: "guest", guestId: "guest-1" }) });
+      }
+      return reply(401, { error: "Unauthorized" });
+    }
+    if (path === "/auth/register") {
+      return reply(201, { guestId: "guest-1", email: JSON.parse(options.body).email });
     }
     for (const [key, handler] of Object.entries(routes)) {
       const [routeMethod, prefix] = key.split(" ");
@@ -44,6 +63,17 @@ const calls = (method, prefix) =>
       url.replace(/^https?:\/\/[^/]+/, "").startsWith(prefix),
   );
 
+function roleFromAuthHeader(header) {
+  const token = header?.replace(/^Bearer\s+/, "");
+  const payload = token?.split(".")[1];
+  if (!payload) return null;
+  try {
+    return JSON.parse(atob(payload.replace(/-/g, "+").replace(/_/g, "/"))).role;
+  } catch {
+    return null;
+  }
+}
+
 beforeEach(() => {
   setRole("agent");
   vi.stubGlobal("fetch", vi.fn());
@@ -60,6 +90,7 @@ describe("reservations management", () => {
     });
 
     render(<App />);
+    await screen.findByRole("button", { name: /Guests$/ });
 
     const table = screen.getByRole("table");
     expect(await within(table).findByText("R-STORED")).toBeInTheDocument();
@@ -74,6 +105,7 @@ describe("reservations management", () => {
     });
 
     render(<App />);
+    await screen.findByRole("button", { name: /Guests$/ });
     await userEvent.selectOptions(screen.getByLabelText("Status"), "cancelled");
 
     await waitFor(() =>
@@ -111,6 +143,7 @@ describe("reservations management", () => {
     });
 
     render(<App />);
+    await screen.findByRole("button", { name: /Guests$/ });
     await userEvent.click(
       screen.getByRole("button", { name: "+ New Reservation" }),
     );
@@ -154,6 +187,7 @@ describe("reservations management", () => {
     });
 
     render(<App />);
+    await screen.findByRole("button", { name: /Guests$/ });
     await userEvent.click(
       await screen.findByRole("button", { name: "Actions for R-STORED" }),
     );
@@ -173,6 +207,7 @@ describe("reservations management", () => {
     });
 
     render(<App />);
+    await screen.findByRole("button", { name: /Guests$/ });
     await userEvent.click(
       await screen.findByRole("button", { name: "Actions for R-STORED" }),
     );
@@ -200,7 +235,7 @@ describe("role switcher and guests page", () => {
   it("logs in with the selected role and shows the guest restriction", async () => {
     mockApi({
       "GET /reservations": (_path, options) =>
-        options.headers.Authorization === "Bearer token-guest"
+        roleFromAuthHeader(options.headers.Authorization) === "guest"
           ? reply(403, { error: "Forbidden" })
           : reply(200, { reservations: [stored] }),
     });
@@ -242,6 +277,7 @@ describe("role switcher and guests page", () => {
     });
 
     render(<App />);
+  await screen.findByRole("button", { name: /Guests$/ });
     await userEvent.click(screen.getByRole("button", { name: /Guests$/ }));
     await userEvent.type(
       screen.getByLabelText("Name, email, phone or loyalty number"),
@@ -257,5 +293,81 @@ describe("role switcher and guests page", () => {
     const history = await screen.findByRole("list", { name: "Stay history" });
     expect(within(history).getByText(/R-STORED/)).toBeInTheDocument();
     expect(calls("GET", "/guests/search?q=test")).toHaveLength(1);
+  });
+});
+
+describe("authentication screen", () => {
+  beforeEach(() => {
+    setRole(null);
+  });
+
+  it("lets a user sign in with credentials", async () => {
+    mockApi({
+      "GET /reservations": () => reply(200, { reservations: [] }),
+    });
+
+    render(<App />);
+    await userEvent.type(screen.getByLabelText("Username or email"), "agent");
+    await userEvent.type(screen.getByLabelText("Password"), "agent123");
+    await userEvent.click(screen.getByRole("button", { name: "Sign in" }));
+
+    expect(await screen.findByRole("button", { name: "Logout" })).toBeInTheDocument();
+    expect(screen.getByText("agent")).toBeInTheDocument();
+  });
+
+  it("shows an error when login fails", async () => {
+    mockApi({});
+
+    render(<App />);
+    await userEvent.type(screen.getByLabelText("Username or email"), "agent");
+    await userEvent.type(screen.getByLabelText("Password"), "wrong");
+    await userEvent.click(screen.getByRole("button", { name: "Sign in" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Unauthorized");
+  });
+
+  it("logs out back to the sign-in screen", async () => {
+    mockApi({
+      "GET /reservations": () => reply(200, { reservations: [] }),
+    });
+
+    render(<App />);
+    await userEvent.type(screen.getByLabelText("Username or email"), "agent");
+    await userEvent.type(screen.getByLabelText("Password"), "agent123");
+    await userEvent.click(screen.getByRole("button", { name: "Sign in" }));
+    await screen.findByRole("button", { name: "Logout" });
+
+    await userEvent.click(screen.getByRole("button", { name: "Logout" }));
+
+    expect(await screen.findByRole("button", { name: "Sign in" })).toBeInTheDocument();
+  });
+
+  it("returns to login when an authenticated request gets 401", async () => {
+    mockApi({
+      "GET /reservations": () => reply(401, { error: "Unauthorized" }),
+    });
+
+    render(<App />);
+    await userEvent.type(screen.getByLabelText("Username or email"), "agent");
+    await userEvent.type(screen.getByLabelText("Password"), "agent123");
+    await userEvent.click(screen.getByRole("button", { name: "Sign in" }));
+
+    expect(await screen.findByRole("button", { name: "Sign in" })).toBeInTheDocument();
+  });
+
+  it("creates and signs in a guest account", async () => {
+    mockApi({
+      "GET /reservations": () => reply(200, { reservations: [] }),
+    });
+
+    render(<App />);
+    await userEvent.type(screen.getByLabelText("First name"), "Guest");
+    await userEvent.type(screen.getByLabelText("Last name"), "User");
+    await userEvent.type(screen.getByLabelText("Email"), "guest@example.com");
+    await userEvent.type(screen.getByLabelText("Guest password"), "secret123");
+    await userEvent.click(screen.getByRole("button", { name: "Create guest account" }));
+
+    expect(await screen.findByRole("button", { name: "Logout" })).toBeInTheDocument();
+    expect(screen.getByText("Guest", { selector: ".role-chip" })).toBeInTheDocument();
   });
 });

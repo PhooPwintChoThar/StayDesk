@@ -66,6 +66,32 @@ button:disabled {
   background: var(--bg);
 }
 
+.auth-shell {
+  align-items: center;
+  justify-content: center;
+}
+
+.auth-panel {
+  width: min(1040px, 100%);
+}
+
+.auth-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 20px;
+}
+
+.auth-grid section {
+  padding: 18px;
+  border-radius: 18px;
+  border: 1px solid var(--line);
+  background: linear-gradient(180deg, rgba(234, 247, 240, 0.92), #fff);
+}
+
+.auth-grid h2 {
+  margin-top: 0;
+}
+
 .sidebar {
   width: 240px;
   flex-shrink: 0;
@@ -183,6 +209,22 @@ button:disabled {
 .user-meta {
   flex: 1;
   min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.user-name {
+  font-weight: 800;
+  color: var(--ink);
+  font-size: 0.92rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.user-role {
+  font-size: 0.76rem;
+  color: var(--muted);
 }
 
 .role-label {
@@ -204,6 +246,11 @@ button:disabled {
   font-weight: 600;
   text-transform: none;
   letter-spacing: 0;
+}
+
+.user-card .page-btn {
+  margin-top: 4px;
+  align-self: flex-start;
 }
 
 .main-panel {
@@ -663,6 +710,22 @@ select {
   display: flex;
   gap: 8px;
   margin: 12px 0;
+}
+
+@media (max-width: 980px) {
+  .page-shell {
+    flex-direction: column;
+  }
+
+  .sidebar {
+    width: 100%;
+    height: auto;
+    position: static;
+  }
+
+  .auth-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 .consent-row {

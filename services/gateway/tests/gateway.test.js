@@ -1,6 +1,7 @@
 import jwt from 'jsonwebtoken';
 import nock from 'nock';
 import request from 'supertest';
+import bcrypt from 'bcryptjs';
 import { createApp } from '../app.js';
 
 const secret = 'gateway-test-secret';
@@ -12,11 +13,31 @@ function token(role) {
   return jwt.sign({ role }, secret);
 }
 
+function uniqueIp(tag) {
+  return `203.0.113.${tag}`;
+}
+
 describe('gateway authentication and proxying', () => {
   beforeAll(() => {
     process.env.ROOM_RATE_SERVICE_URL = roomRateUrl;
     process.env.RESERVATION_SERVICE_URL = reservationUrl;
     process.env.GUEST_SERVICE_URL = guestUrl;
+    process.env.USERS_JSON = JSON.stringify([
+      {
+        username: 'agent',
+        role: 'agent',
+        passwordHash: bcrypt.hashSync('agent123', 10)
+      },
+      {
+        username: 'manager',
+        role: 'manager',
+        passwordHash: bcrypt.hashSync('manager123', 10)
+      }
+    ]);
+  });
+
+  beforeEach(() => {
+    process.env.ALLOW_DEV_LOGIN = 'false';
   });
 
   afterEach(() => {
@@ -24,8 +45,11 @@ describe('gateway authentication and proxying', () => {
   });
 
   afterAll(() => {
-    nock.restore();
+    delete process.env.USERS_JSON;
+    delete process.env.ALLOW_DEV_LOGIN;
   });
+
+  afterAll(() => nock.restore());
 
   it('allows public availability search without a token', async () => {
     const app = createApp({ secret });
@@ -52,6 +76,65 @@ describe('gateway authentication and proxying', () => {
 
     expect(missing.status).toBe(401);
     expect(invalid.status).toBe(401);
+  });
+
+  it('accepts credential login when dev login is off', async () => {
+    process.env.ALLOW_DEV_LOGIN = 'false';
+    const app = createApp({ secret });
+
+    const success = await request(app)
+      .post('/login')
+      .set('X-Forwarded-For', uniqueIp('10'))
+      .send({ username: 'agent', password: 'agent123' });
+
+    const failure = await request(app)
+      .post('/login')
+      .set('X-Forwarded-For', uniqueIp('11'))
+      .send({ username: 'agent', password: 'bad-password' });
+
+    const disabledDevLogin = await request(app)
+      .post('/login')
+      .set('X-Forwarded-For', uniqueIp('12'))
+      .send({ role: 'manager' });
+
+    expect(success.status).toBe(200);
+    expect(jwt.verify(success.body.token, secret)).toMatchObject({ role: 'agent', sub: 'agent' });
+    expect(failure.status).toBe(401);
+    expect(disabledDevLogin.status).toBe(400);
+  });
+
+  it('accepts dev login only when explicitly enabled', async () => {
+    process.env.ALLOW_DEV_LOGIN = 'true';
+    const app = createApp({ secret });
+
+    const response = await request(app)
+      .post('/login')
+      .set('X-Forwarded-For', uniqueIp('13'))
+      .send({ role: 'manager' });
+
+    expect(response.status).toBe(200);
+    expect(jwt.verify(response.body.token, secret)).toMatchObject({ role: 'manager' });
+  });
+
+  it('rate limits repeated login attempts from the same ip', async () => {
+    process.env.ALLOW_DEV_LOGIN = 'false';
+    const app = createApp({ secret });
+    const ip = uniqueIp('14');
+
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const response = await request(app)
+        .post('/login')
+        .set('X-Forwarded-For', ip)
+        .send({ username: 'agent', password: 'bad-password' });
+      expect(response.status).toBe(401);
+    }
+
+    const limited = await request(app)
+      .post('/login')
+      .set('X-Forwarded-For', ip)
+      .send({ username: 'agent', password: 'bad-password' });
+
+    expect(limited.status).toBe(429);
   });
 
   it('returns 403 when a guest requests an agent-only route', async () => {

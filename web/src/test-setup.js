@@ -1,5 +1,9 @@
 import '@testing-library/jest-dom/vitest';
 import { cleanup } from '@testing-library/react';
 import { afterEach } from 'vitest';
+import { logout } from './api.js';
 
-afterEach(cleanup);
+afterEach(() => {
+	cleanup();
+	logout();
+});

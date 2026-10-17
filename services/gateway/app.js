@@ -6,10 +6,26 @@ import bcrypt from 'bcryptjs';
 import { ROLES, buildGatewayChain, isOwnershipRoute } from './auth-chain.js';
 
 const INTERNAL_TOKEN = process.env.INTERNAL_TOKEN;
-const ALLOW_DEV_LOGIN = process.env.ALLOW_DEV_LOGIN !== 'false';
 const LOGIN_LIMIT = 8;
 const LOGIN_WINDOW_MS = 5 * 60 * 1000;
 const loginAttempts = new Map();
+
+const demoUsers = [
+  { username: 'agent', role: 'agent', passwordHash: bcrypt.hashSync('agent123', 10) },
+  { username: 'manager', role: 'manager', passwordHash: bcrypt.hashSync('manager123', 10) },
+];
+
+function allowDevLogin() {
+  return process.env.ALLOW_DEV_LOGIN === 'true';
+}
+
+function requestIp(req) {
+  const forwarded = req.headers['x-forwarded-for'];
+  if (typeof forwarded === 'string' && forwarded.trim()) {
+    return forwarded.split(',')[0].trim();
+  }
+  return req.ip || req.socket?.remoteAddress || '127.0.0.1';
+}
 
 const internalUsers = () => {
   const raw = process.env.USERS_JSON;
@@ -22,10 +38,11 @@ const internalUsers = () => {
     }
   }
 
-  return [
-    { username: 'agent', role: 'agent', passwordHash: bcrypt.hashSync('agent123', 10) },
-    { username: 'manager', role: 'manager', passwordHash: bcrypt.hashSync('manager123', 10) },
-  ];
+  if (allowDevLogin() || process.env.NODE_ENV !== 'production') {
+    return demoUsers;
+  }
+
+  return [];
 };
 
 function loginAllowed(ip) {
@@ -68,12 +85,15 @@ export function createApp({
   app.get('/health', (_req, res) => res.status(200).json({ status: 'ok' }));
 
   app.post('/login', (req, res) => {
-    if (!loginAllowed(req.ip)) {
+    if (!loginAllowed(requestIp(req))) {
       return res.status(429).json({ error: 'TooManyRequests' });
     }
 
     const { role, username, password } = req.body ?? {};
-    if (ALLOW_DEV_LOGIN && role) {
+    if (role) {
+      if (!allowDevLogin()) {
+        return res.status(400).json({ error: 'BadRequest' });
+      }
       if (!ROLES.includes(role) || !secret) {
         return res.status(400).json({ error: 'BadRequest' });
       }

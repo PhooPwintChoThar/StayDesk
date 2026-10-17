@@ -33,6 +33,7 @@ services:
     environment:
       PORT: 3000
       JWT_SECRET: ${JWT_SECRET:-dev-secret-change-me}
+      ALLOW_DEV_LOGIN: "true"
       GUEST_SERVICE_URL: http://guest:3000
       RESERVATION_SERVICE_URL: http://reservation:3000
       ROOM_RATE_SERVICE_URL: http://room-rate:3000

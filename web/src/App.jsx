@@ -1,5 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { apiRequest, setRole as setApiRole } from "./api.js";
+import {
+  apiRequest,
+  getDevRole,
+  getSession,
+  login,
+  loginWithRole,
+  logout,
+  registerGuestAccount,
+  setRole as setDevRole,
+  subscribeSession,
+} from "./api.js";
+
+const DEV_ROLE_SWITCH = import.meta.env.VITE_DEV_ROLE_SWITCH === "true";
 
 const initialSearch = {
   checkIn: "",
@@ -62,8 +74,140 @@ function Icon({ name, size = 18, className = "nav-icon" }) {
   );
 }
 
+function LoginScreen({
+  authError,
+  busy,
+  loginForm,
+  setLoginForm,
+  guestForm,
+  setGuestForm,
+  onSignIn,
+  onCreateGuest,
+}) {
+  return (
+    <main className="page-shell auth-shell">
+      <section className="register-panel auth-panel">
+        <div className="register-header">
+          <div>
+            <h1>StayDesk</h1>
+            <p className="muted">Hotel guest and reservation access</p>
+          </div>
+        </div>
+
+        {authError && (
+          <p role="alert" className="error">
+            {authError}
+          </p>
+        )}
+
+        <div className="auth-grid">
+          <section aria-labelledby="sign-in-heading">
+            <h2 id="sign-in-heading">Sign in</h2>
+            <form className="form-grid" onSubmit={onSignIn}>
+              <label>
+                Username or email
+                <input
+                  required
+                  value={loginForm.username}
+                  onChange={(event) =>
+                    setLoginForm({ ...loginForm, username: event.target.value })
+                  }
+                />
+              </label>
+              <label>
+                Password
+                <input
+                  required
+                  type="password"
+                  value={loginForm.password}
+                  onChange={(event) =>
+                    setLoginForm({ ...loginForm, password: event.target.value })
+                  }
+                />
+              </label>
+              <button disabled={busy} type="submit" className="primary-action">
+                Sign in
+              </button>
+            </form>
+          </section>
+
+          <section aria-labelledby="create-guest-heading">
+            <h2 id="create-guest-heading">Create guest account</h2>
+            <form className="form-grid" onSubmit={onCreateGuest}>
+              <label>
+                First name
+                <input
+                  required
+                  value={guestForm.firstName}
+                  onChange={(event) =>
+                    setGuestForm({ ...guestForm, firstName: event.target.value })
+                  }
+                />
+              </label>
+              <label>
+                Last name
+                <input
+                  required
+                  value={guestForm.lastName}
+                  onChange={(event) =>
+                    setGuestForm({ ...guestForm, lastName: event.target.value })
+                  }
+                />
+              </label>
+              <label>
+                Email
+                <input
+                  required
+                  type="email"
+                  value={guestForm.email}
+                  onChange={(event) =>
+                    setGuestForm({ ...guestForm, email: event.target.value })
+                  }
+                />
+              </label>
+              <label>
+                Phone (optional)
+                <input
+                  value={guestForm.phone}
+                  onChange={(event) =>
+                    setGuestForm({ ...guestForm, phone: event.target.value })
+                  }
+                />
+              </label>
+              <label>
+                Guest password
+                <input
+                  required
+                  type="password"
+                  value={guestForm.password}
+                  onChange={(event) =>
+                    setGuestForm({ ...guestForm, password: event.target.value })
+                  }
+                />
+              </label>
+              <button disabled={busy} type="submit" className="primary-action">
+                Create guest account
+              </button>
+            </form>
+          </section>
+        </div>
+      </section>
+    </main>
+  );
+}
+
 export default function App() {
-  const [role, setRole] = useState("agent");
+  const [session, setSession] = useState(() => getSession());
+  const [authError, setAuthError] = useState("");
+  const [authBusy, setAuthBusy] = useState(false);
+  const [loginForm, setLoginForm] = useState({ username: "", password: "" });
+  const [guestForm, setGuestForm] = useState({
+    firstName: "",
+    lastName: "",
+    email: "",
+    phone: "",
+    password: "",
+  });
   const [view, setView] = useState("reservations");
 
   const [reservations, setReservations] = useState([]);
@@ -88,8 +232,83 @@ export default function App() {
 
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
-  const roleRef = useRef(role);
-  roleRef.current = role;
+  const sessionRef = useRef(session);
+  sessionRef.current = session;
+
+  useEffect(() => {
+    return subscribeSession(setSession);
+  }, []);
+
+  useEffect(() => {
+    if (session || !DEV_ROLE_SWITCH || !getDevRole()) {
+      return undefined;
+    }
+
+    let cancelled = false;
+    setAuthBusy(true);
+    loginWithRole(getDevRole())
+      .catch((err) => {
+        if (!cancelled) setAuthError(err.message);
+      })
+      .finally(() => {
+        if (!cancelled) setAuthBusy(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [session]);
+
+  const role = session?.claims?.role || (DEV_ROLE_SWITCH ? getDevRole() : null);
+  const currentRole = ROLES.find((item) => item.value === role) || ROLES[0];
+
+  async function handleSignIn(event) {
+    event.preventDefault();
+    setAuthError("");
+    setAuthBusy(true);
+    try {
+      await login(loginForm.username.trim(), loginForm.password);
+    } catch (err) {
+      setAuthError(err.message);
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  async function handleCreateGuest(event) {
+    event.preventDefault();
+    setAuthError("");
+    setAuthBusy(true);
+    try {
+      await registerGuestAccount(guestForm);
+      setGuestForm({
+        firstName: "",
+        lastName: "",
+        email: "",
+        phone: "",
+        password: "",
+      });
+      setLoginForm({ username: guestForm.email.trim(), password: guestForm.password });
+    } catch (err) {
+      setAuthError(err.message);
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  function handleLogout() {
+    logout();
+    setSession(null);
+    setView("reservations");
+    setError("");
+    setAuthError("");
+    setReservations([]);
+    setGuests([]);
+    setSelectedGuest(null);
+    setGuestReservations([]);
+    setLookedUp(null);
+    setLookupNo("");
+  }
 
   const loadReservations = useCallback(async () => {
     const params = new URLSearchParams();
@@ -99,25 +318,25 @@ export default function App() {
 
     try {
       const result = await apiRequest(`/reservations?${params}`);
-      if (roleRef.current === "guest") {
+      if (sessionRef.current?.claims?.role === "guest") {
         setReservations([]);
         return;
       }
       setReservations(result.reservations || []);
     } catch (err) {
       setReservations([]);
-      if (roleRef.current !== "guest") setError(err.message);
+      if (sessionRef.current?.claims?.role !== "guest") setError(err.message);
     }
   }, [filters.status, filters.from, filters.to]);
 
   useEffect(() => {
-    if (view === "reservations") loadReservations();
-  }, [view, loadReservations, role]);
+    if (session && view === "reservations") loadReservations();
+  }, [session, view, loadReservations]);
 
-  function changeRole(nextRole) {
-    setApiRole(nextRole);
-    setRole(nextRole);
+  async function changeRole(nextRole) {
+    setDevRole(nextRole);
     setError("");
+    setAuthError("");
     setGuests([]);
     setSelectedGuest(null);
     setGuestReservations([]);
@@ -126,6 +345,11 @@ export default function App() {
     if (nextRole === "guest") {
       setView("reservations");
       setReservations([]);
+    }
+    try {
+      await loginWithRole(nextRole);
+    } catch (err) {
+      setAuthError(err.message);
     }
   }
 
@@ -371,7 +595,6 @@ export default function App() {
   const revenueCurrency = reservations[0]?.currency || "";
   const confirmedPct = reservations.length
       ? Math.round((confirmedCount / reservations.length) * 100) : 0;
-  const currentRole = ROLES.find((item) => item.value === role);
   const today = new Date().toLocaleString("en-US", {
     month: "short",
     day: "numeric",
@@ -379,6 +602,21 @@ export default function App() {
     hour: "numeric",
     minute: "2-digit",
   });
+
+  if (!session) {
+    return (
+      <LoginScreen
+        authError={authError}
+        busy={authBusy}
+        loginForm={loginForm}
+        setLoginForm={setLoginForm}
+        guestForm={guestForm}
+        setGuestForm={setGuestForm}
+        onSignIn={handleSignIn}
+        onCreateGuest={handleCreateGuest}
+      />
+    );
+  }
 
   return (
     <main className="page-shell">
@@ -425,19 +663,30 @@ export default function App() {
         <div className="user-card">
           <div className="user-avatar">{currentRole.initials}</div>
           <div className="user-meta">
+            <div className="user-name">{session?.claims?.sub || currentRole.label}</div>
+            <div className="user-role">{currentRole.label}</div>
             <label className="role-label">
-              Signed in as
-              <select
-                value={role}
-                onChange={(event) => changeRole(event.target.value)}
-              >
-                {ROLES.map((item) => (
-                  <option key={item.value} value={item.value}>
-                    {item.label}
-                  </option>
-                ))}
-              </select>
+              {DEV_ROLE_SWITCH ? (
+                <>
+                  Signed in as
+                  <select
+                    value={role}
+                    onChange={(event) => changeRole(event.target.value)}
+                  >
+                    {ROLES.map((item) => (
+                      <option key={item.value} value={item.value}>
+                        {item.label}
+                      </option>
+                    ))}
+                  </select>
+                </>
+              ) : (
+                <span>{session?.claims?.sub}</span>
+              )}
             </label>
+            <button type="button" className="page-btn" onClick={handleLogout}>
+              Logout
+            </button>
           </div>
         </div>
       </aside>

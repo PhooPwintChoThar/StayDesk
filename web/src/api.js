@@ -2,25 +2,113 @@ const API_BASE_URL = (
   import.meta.env.VITE_API_BASE_URL || "http://localhost:3010"
 ).replace(/\/$/, "");
 
-let role = "agent";
+const DEV_ROLE_SWITCH = import.meta.env.VITE_DEV_ROLE_SWITCH === "true";
+
+let session = null;
+let devRole = null;
 let tokenPromise;
+const listeners = new Set();
+
+function decodeToken(token) {
+  const payload = token.split(".")[1];
+  if (!payload) return {};
+  const text = atob(payload.replace(/-/g, "+").replace(/_/g, "/"));
+  try {
+    return JSON.parse(text);
+  } catch {
+    return {};
+  }
+}
+
+function notifySessionChange() {
+  for (const listener of listeners) listener(session);
+}
+
+function setSession(nextSession) {
+  session = nextSession;
+  notifySessionChange();
+}
+
+function clearSession({ clearDevRole = false } = {}) {
+  session = null;
+  tokenPromise = undefined;
+  if (clearDevRole || !DEV_ROLE_SWITCH) devRole = null;
+  notifySessionChange();
+}
 
 export function setRole(nextRole) {
-  role = nextRole;
+  devRole = nextRole || null;
   tokenPromise = undefined;
 }
 
-function getToken() {
-  tokenPromise ??= fetch(`${API_BASE_URL}/login`, {
+export function getDevRole() {
+  return devRole;
+}
+
+export function getSession() {
+  return session;
+}
+
+export function subscribeSession(listener) {
+  listeners.add(listener);
+  listener(session);
+  return () => listeners.delete(listener);
+}
+
+export function logout() {
+  devRole = null;
+  clearSession({ clearDevRole: true });
+}
+
+async function requestLogin(body) {
+  const response = await fetch(`${API_BASE_URL}/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ role }),
-  })
-    .then(async (res) => {
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.error || "Login failed");
-      return data.token;
-    })
+    body: JSON.stringify(body),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || "Login failed");
+
+  const claims = decodeToken(data.token);
+  setSession({ token: data.token, claims });
+  return session;
+}
+
+export async function login(username, password) {
+  devRole = null;
+  return requestLogin({ username, password });
+}
+
+export async function loginWithRole(role) {
+  if (!DEV_ROLE_SWITCH) {
+    throw new Error("Dev role switch is disabled.");
+  }
+  devRole = role;
+  return requestLogin({ role });
+}
+
+export async function registerGuestAccount(details) {
+  const response = await fetch(`${API_BASE_URL}/auth/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(details),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data.message || data.error || "Registration failed");
+  }
+  await login(details.email, details.password);
+  return data;
+}
+
+async function getToken() {
+  if (session?.token) return session.token;
+  if (!DEV_ROLE_SWITCH || !devRole) {
+    throw new Error("Unauthorized");
+  }
+
+  tokenPromise ??= loginWithRole(devRole)
+    .then(() => session?.token)
     .catch((err) => {
       tokenPromise = undefined;
       throw err;
@@ -33,7 +121,9 @@ export async function apiRequest(path, options = {}) {
   const response = await fetch(`${API_BASE_URL}${path}`, {
     ...options,
     headers: {
-      ...(options.body ? { "Content-Type": "application/json" } : {}),
+      ...(options.body && !options.headers?.["Content-Type"] && !options.headers?.["content-type"]
+        ? { "Content-Type": "application/json" }
+        : {}),
       Authorization: `Bearer ${token}`,
       ...options.headers,
     },
@@ -42,6 +132,9 @@ export async function apiRequest(path, options = {}) {
   if (response.status === 204) return null;
 
   const data = await response.json().catch(() => ({}));
+  if (response.status === 401) {
+    clearSession({ clearDevRole: true });
+  }
   if (!response.ok) {
     throw new Error(
       data.message || data.error || `Request failed (${response.status})`,

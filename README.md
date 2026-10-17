@@ -71,7 +71,26 @@ Quick check: `curl http://localhost:3010/health` should return `{"status":"ok"}`
 
 ## Authentication (dev only)
 
-The gateway validates JWTs and enforces roles (`guest`, `agent`, `manager`). It supports credential login with `POST /login {"username","password"}` and guest registration with `POST /auth/register`. The old role-based `POST /login {"role":"agent"}` path stays available while `ALLOW_DEV_LOGIN=true` for demos and tests; set it to `false` in production. If `INTERNAL_TOKEN` is set, the backend services require it on internal calls.
+The gateway validates JWTs and enforces roles (`guest`, `agent`, `manager`). The web app now opens on a login screen with credential sign-in and a guest account creation form. Guest registration goes through `POST /auth/register`; sign-in uses `POST /login {"username","password"}`.
+
+The legacy role-based `POST /login {"role":"agent"}` path is only available when `ALLOW_DEV_LOGIN=true`. That flag now defaults to `false` in code, so it must be set explicitly for demos and tests that still use the dev route. Demo accounts are available when `ALLOW_DEV_LOGIN=true` or when `NODE_ENV` is not `production`:
+
+| Username | Password | Role |
+|---|---|---|
+| agent | agent123 | agent |
+| manager | manager123 | manager |
+
+Environment variables you may want to set:
+
+| Variable | Purpose |
+|---|---|
+| `ALLOW_DEV_LOGIN` | Enables the role-based dev login when set to `true` |
+| `USERS_JSON` | Optional JSON array of `{ username, role, passwordHash }` records for credential login |
+| `VITE_DEV_ROLE_SWITCH` | Enables the dev-only role selector in the web app when set to `true` |
+| `INTERNAL_TOKEN` | Shared secret required by internal service-to-service calls |
+| `CANCELLATION_POLICY` | `full`, `partial`, or `none` reservation cancellation policy |
+| `PAYMENT_MODE` | Billing demo mode (`decline` forces a declined deposit) |
+| `VITE_API_BASE_URL` | Optional override for the gateway URL used by the web app |
 
 ## Day-to-day commands
 
@@ -106,7 +125,8 @@ Use fresh dates each time, because a confirmed booking uses up a room.
 
 1. **Successful booking.** Book in the UI. Expect "Booking confirmed", and an email line in `docker compose logs notification`.
 2. **Declined deposit.** Add `PAYMENT_MODE: decline` under `billing.environment` in `docker-compose.yml`, run `docker compose up -d --force-recreate billing`, and book. Expect a "deposit declined" error. Search the same dates: availability is unchanged. Check `select id, status from holds` in `room_rate_db`: the hold is `released`. **Remove the variable and recreate billing afterwards.**
-3. **Notification down.** `docker compose stop notification`, then book (still confirmed). In the RabbitMQ UI (http://localhost:15672, Queues) the `ReservationConfirmed` queue shows Ready = 1. Run `docker compose start notification`: the queue drops to 0 and the email is logged.
+3. **Login flow.** Open the web app, sign in as `agent` / `agent123`, and confirm the sidebar shows the signed-in name and role. Use the logout button to return to the login screen. Create a guest account with the guest form and confirm you land in the guest session.
+4. **Notification down.** `docker compose stop notification`, then book (still confirmed). In the RabbitMQ UI (http://localhost:15672, Queues) the `ReservationConfirmed` queue shows Ready = 1. Run `docker compose start notification`: the queue drops to 0 and the email is logged.
 
 Also verify cancel (refund row in `payment_db`, room available again) and modify (new dates, recalculated total, 409 when no rooms are free).
 
