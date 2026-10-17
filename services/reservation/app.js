@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import axios from "axios";
 import express from "express";
 import { pool } from "./db.js";
+import { HttpError, runSaga } from "./saga.js";
+import { createCancellationPolicy } from "./cancellation-policy.js";
 
 const DEPOSIT_PERCENT = 30;
 
@@ -46,16 +48,184 @@ function totalPrice(nightlyRate, checkIn, checkOut) {
 }
 
 function depositPrice(amount) {
-  return Math.round((amount * DEPOSIT_PERCENT) / 100 * 100) / 100;
+  return Math.round(((amount * DEPOSIT_PERCENT) / 100) * 100) / 100;
 }
 
 function fail(res, status, error, message) {
   return res.status(status).json({ error, message });
 }
 
-async function releaseHold(id) {
-  if (id) await axios.delete(`${roomRateUrl()}/holds/${id}`);
+function parseGuests(value) {
+  if (value == null || value === "") return null;
+  const guests = Number(value);
+  return Number.isInteger(guests) && guests >= 1 ? guests : undefined;
 }
+
+function actorFromRequest(req) {
+  return {
+    id: req.headers["x-user-id"] || null,
+    role: req.headers["x-user-role"] || null,
+  };
+}
+
+function depositHeldValue(reservation) {
+  return Number(
+    reservation.depositHeld ??
+    reservation.deposit_net ??
+    reservation.depositAmount ??
+    reservation.deposit_amount ??
+    0,
+  );
+}
+
+function currencyValue(reservation) {
+  return String(reservation.currency ?? "USD").trim();
+}
+
+function quoteFromHours(hoursBeforeCheckIn, heldAmount, overridePercent) {
+  const effectivePercent = overridePercent ?? (hoursBeforeCheckIn >= 48 ? 100 : hoursBeforeCheckIn >= 24 ? 50 : 0);
+  const refundAmount = Math.round((Number(heldAmount) * effectivePercent) * 100) / 10000;
+  const feeAmount = Math.round((Number(heldAmount) - refundAmount) * 100) / 100;
+  return { refundAmount, feeAmount };
+}
+
+async function loadReservation(db, reservationNo) {
+  const result = await db.query(
+    `SELECT ${reservationSelect},
+            cancelled_at AS "cancelledAt", refund_amount::float AS "refundAmount",
+            cancellation_fee::float AS "cancellationFee"
+     FROM reservations
+     WHERE reservation_no = $1`,
+    [reservationNo],
+  );
+  return result.rows[0] || null;
+}
+
+async function loadPaymentSources(db, reservation) {
+  const result = await db.query(
+    `SELECT rp.id,
+            rp.billing_payment_id AS "billingPaymentId",
+            rp.type,
+            rp.amount::float AS amount,
+            rp.currency,
+            rp.created_at AS "createdAt",
+            COALESCE((
+              SELECT SUM(r.amount)::float
+              FROM reservation_payments r
+              WHERE r.reservation_no = rp.reservation_no
+                AND r.type IN ('refund', 'cancellation_refund')
+                AND r.deposit_ref = rp.billing_payment_id
+            ), 0)::float AS refunded
+     FROM reservation_payments rp
+     WHERE rp.reservation_no = $1
+       AND rp.type IN ('deposit', 'topup')
+     ORDER BY rp.created_at DESC, rp.id DESC`,
+    [reservation.reservation_no],
+  );
+  if (result.rowCount === 0 && reservation.deposit_id) {
+    return [{
+      id: `legacy-${reservation.deposit_id}`,
+      billingPaymentId: reservation.deposit_id,
+      type: 'deposit',
+      amount: Number(reservation.deposit_amount),
+      currency: reservation.currency,
+      createdAt: reservation.created_at,
+      refunded: 0,
+    }];
+  }
+  return result.rows;
+}
+
+function allocateRefundAmount(sources, amount) {
+  let remaining = Number(amount);
+  const allocations = [];
+
+  for (const source of sources) {
+    if (remaining <= 0) break;
+    const available = Math.max(0, Number(source.amount) - Number(source.refunded || 0));
+    if (available <= 0) continue;
+    const used = Math.min(remaining, available);
+    allocations.push({ source, amount: used });
+    remaining = Math.round((remaining - used) * 100) / 100;
+  }
+
+  if (remaining > 0) {
+    throw new Error('Held amount is inconsistent with recorded deposits.');
+  }
+
+  return allocations;
+}
+
+async function writeLedgerRow(client, {
+  reservationNo,
+  type,
+  billingPaymentId,
+  depositRef,
+  amount,
+  currency,
+  reason,
+  actor,
+}) {
+  await client.query(
+    `INSERT INTO reservation_payments (
+      id, reservation_no, type, billing_payment_id, deposit_ref,
+      amount, currency, reason, actor_id, actor_role
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+    [
+      randomUUID(),
+      reservationNo,
+      type,
+      billingPaymentId ?? null,
+      depositRef ?? null,
+      amount,
+      currency,
+      reason ?? null,
+      actor.id,
+      actor.role,
+    ],
+  );
+}
+
+async function authorizeTopUp({ http, reservationNo, guestId, amount, currency }) {
+  const response = await http.post(`${billingUrl()}/deposits`, {
+    reservationNo,
+    guestId,
+    amount,
+    currency,
+  });
+  return response.data.id ?? response.data.depositId;
+}
+
+async function refundAcrossSources({ http, reservationNo, sources, amount, currency }) {
+  const allocations = allocateRefundAmount(sources, amount);
+  const refunds = [];
+
+  for (const allocation of allocations) {
+    const response = await http.post(`${billingUrl()}/refunds`, {
+      depositId: allocation.source.billingPaymentId,
+      amount: allocation.amount,
+      currency,
+    });
+    refunds.push({
+      source: allocation.source,
+      amount: allocation.amount,
+      refundId: response.data.refundId ?? response.data.id,
+    });
+  }
+
+  return refunds;
+}
+
+const reservationSelect = `
+  reservation_no AS "reservationNo", guest_id AS "guestId",
+  room_type_id AS "roomTypeId",
+  to_char(check_in, 'YYYY-MM-DD') AS "checkIn",
+  to_char(check_out, 'YYYY-MM-DD') AS "checkOut",
+  total_amount::float AS "totalAmount",
+  deposit_id AS "depositId", deposit_amount::float AS "depositAmount",
+  COALESCE(deposit_net, deposit_amount)::float AS "depositHeld",
+  currency, status, guests
+`;
 
 async function publishConfirmed(payload) {
   const amqp = await import("amqplib");
@@ -81,11 +251,17 @@ export function createApp({
   db = pool,
   http = axios,
   publishEvent = publishConfirmed,
+  cancellationPolicy = createCancellationPolicy(),
 } = {}) {
   const app = express();
   app.use(express.json());
+  app.use((req, res, next) => {
+    const required = process.env.INTERNAL_TOKEN;
+    if (!required || req.headers['x-internal-token'] === required) return next();
+    return res.status(401).json({ error: 'Unauthorized' });
+  });
 
-  const release = async (id) => {
+  const releaseHold = async (id) => {
     if (!id) return;
     try {
       await http.delete(`${roomRateUrl()}/holds/${id}`);
@@ -95,16 +271,29 @@ export function createApp({
     }
   };
 
+  async function findAvailability(checkIn, checkOut, roomTypeId, guests, excludeHoldId) {
+    const availabilityResult = await http.get(`${roomRateUrl()}/availability`, {
+      params: {
+        checkIn,
+        checkOut,
+        roomTypeId,
+        guests: guests || undefined,
+        excludeHoldId: excludeHoldId || undefined,
+      },
+    });
+    return availabilityResult.data.availability?.find(
+      (item) => item.roomTypeId === roomTypeId,
+    );
+  }
+
   app.get("/health", (_req, res) => res.status(200).json({ status: "ok" }));
 
   app.post("/reservations", async (req, res, next) => {
-    const { guest, roomTypeId, checkIn, checkOut } = req.body ?? {};
+    const { guest, roomTypeId, checkIn, checkOut, channel } = req.body ?? {};
+    const guests = parseGuests(req.body?.guests);
+    const actor = actorFromRequest(req);
 
-    if (
-      !guest ||
-      !roomTypeId ||
-      !validDates(checkIn, checkOut)
-    ) {
+    if (!guest || !roomTypeId || !validDates(checkIn, checkOut) || guests === undefined) {
       return fail(
         res,
         400,
@@ -114,129 +303,179 @@ export function createApp({
     }
 
     const reservationNo = `R-${randomUUID()}`;
-    let holdId;
-    let guestId;
-    let depositId;
-    let depositAmount;
-    let currency;
-    let saved = false;
 
     try {
-      const availabilityResult = await http.get(
-        `${roomRateUrl()}/availability`,
+      const result = await runSaga([
         {
-          params: { checkIn, checkOut, roomTypeId },
+          async execute() {
+            const availability = await findAvailability(
+              checkIn,
+              checkOut,
+              roomTypeId,
+              guests,
+            );
+            if (!availability?.available || availability.roomsAvailable < 1) {
+              throw new HttpError(
+                409,
+                "Conflict",
+                "No rooms are available for those dates.",
+              );
+            }
+            const amount = totalPrice(availability.nightlyRate, checkIn, checkOut);
+            return {
+              amount,
+              depositAmount: depositPrice(amount),
+              currency: availability.currency,
+            };
+          },
         },
-      );
-      const availability = availabilityResult.data.availability?.find(
-        (item) => item.roomTypeId === roomTypeId,
-      );
-
-      if (!availability?.available || availability.roomsAvailable < 1) {
-        return fail(
-          res,
-          409,
-          "Conflict",
-          "No rooms are available for those dates.",
-        );
-      }
-
-      const amount = totalPrice(availability.nightlyRate, checkIn, checkOut);
-      depositAmount = depositPrice(amount);
-      currency = availability.currency;
-      const holdResult = await http.post(`${roomRateUrl()}/holds`, {
-        roomTypeId,
-        checkIn,
-        checkOut,
-      });
-      holdId = holdResult.data.id;
-
-      const guestResult = await http.post(
-        `${guestUrl()}/guests/get-or-create`,
-        guest,
-      );
-      guestId = guestResult.data.id;
-
-      let depositResult;
-      try {
-        depositResult = await http.post(`${billingUrl()}/deposits`, {
-          reservationNo,
-          guestId,
-          amount: depositAmount,
-          currency,
-        });
-      } catch (err) {
-        console.error(err);
-        if (err.response?.status === 402) {
-          await release(holdId);
-          holdId = undefined;
-          return fail(res, 402, "PaymentDeclined", "The deposit was declined.");
-        }
-        throw err;
-      }
-      depositId = depositResult.data.id ?? depositResult.data.depositId;
-
-      await db.query(
-        `INSERT INTO reservations
-          (reservation_no, guest_id, room_type_id, hold_id, check_in, check_out,
-           total_amount, deposit_id, deposit_amount, currency, status)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'confirmed')`,
-        [
-          reservationNo,
-          guestId,
-          roomTypeId,
-          holdId,
-          checkIn,
-          checkOut,
-          amount,
-          depositId,
-          depositAmount,
-          currency,
-        ],
-      );
-      saved = true;
-
-      await http.post(`${roomRateUrl()}/holds/${holdId}/confirm`);
-
-      await publishEvent({
-        reservationNo,
-        guestId,
-        roomTypeId,
-        checkIn,
-        checkOut,
-        totalAmount: amount,
-        currency,
-        confirmedAt: new Date().toISOString(),
-      });
+        {
+          async execute() {
+            const holdResult = await http.post(`${roomRateUrl()}/holds`, {
+              roomTypeId,
+              checkIn,
+              checkOut,
+            });
+            return { holdId: holdResult.data.id };
+          },
+          async compensate(ctx) {
+            await releaseHold(ctx.holdId);
+          },
+        },
+        {
+          async execute() {
+            const guestResult = await http.post(
+              `${guestUrl()}/guests/get-or-create`,
+              guest,
+            );
+            return {
+              guestId: guestResult.data.id,
+              guestEmail: guestResult.data.email || guest.email,
+              guestPhone: guestResult.data.phone || guest.phone,
+            };
+          },
+        },
+        {
+          async execute(ctx) {
+            try {
+              const depositResult = await http.post(`${billingUrl()}/deposits`, {
+                reservationNo,
+                guestId: ctx.guestId,
+                amount: ctx.depositAmount,
+                currency: ctx.currency,
+              });
+              return {
+                depositId: depositResult.data.id ?? depositResult.data.depositId,
+              };
+            } catch (err) {
+              if (err.response?.status === 402) {
+                throw new HttpError(
+                  402,
+                  "PaymentDeclined",
+                  "The deposit was declined.",
+                );
+              }
+              throw err;
+            }
+          },
+          async compensate(ctx) {
+            if (!ctx.depositId) return;
+            await http.post(`${billingUrl()}/refunds`, {
+              depositId: ctx.depositId,
+              amount: ctx.depositAmount,
+              currency: ctx.currency,
+            });
+          },
+        },
+        {
+          async execute(ctx) {
+            const client = await db.connect();
+            try {
+              await client.query('BEGIN');
+              await client.query(
+                `INSERT INTO reservations
+                  (reservation_no, guest_id, room_type_id, hold_id, check_in, check_out,
+                   total_amount, deposit_id, deposit_amount, deposit_net, currency, status, guests)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'confirmed', $12)`,
+                [
+                  reservationNo,
+                  ctx.guestId,
+                  roomTypeId,
+                  ctx.holdId,
+                  checkIn,
+                  checkOut,
+                  ctx.amount,
+                  ctx.depositId,
+                  ctx.depositAmount,
+                  ctx.depositAmount,
+                  ctx.currency,
+                  guests,
+                ],
+              );
+              await writeLedgerRow(client, {
+                reservationNo,
+                type: 'deposit',
+                billingPaymentId: ctx.depositId,
+                amount: ctx.depositAmount,
+                currency: ctx.currency,
+                reason: 'initial',
+                actor,
+              });
+              await client.query('COMMIT');
+            } catch (error) {
+              await client.query('ROLLBACK').catch(() => {});
+              throw error;
+            } finally {
+              client.release();
+            }
+            return { saved: true };
+          },
+          async compensate() {
+            await db.query("DELETE FROM reservations WHERE reservation_no = $1", [
+              reservationNo,
+            ]);
+          },
+        },
+        {
+          async execute(ctx) {
+            await http.post(`${roomRateUrl()}/holds/${ctx.holdId}/confirm`);
+          },
+        },
+        {
+          async execute(ctx) {
+            await publishEvent({
+              reservationNo,
+              guestId: ctx.guestId,
+              guestEmail: ctx.guestEmail,
+              guestPhone: ctx.guestPhone,
+              roomTypeId,
+              checkIn,
+              checkOut,
+              totalAmount: ctx.amount,
+              currency: ctx.currency,
+              channel: channel === "sms" ? "sms" : "email",
+              confirmedAt: new Date().toISOString(),
+            });
+          },
+        },
+      ]);
 
       return res.status(201).json({
         reservationNo,
-        guestId,
+        guestId: result.guestId,
         roomTypeId,
         checkIn,
         checkOut,
-        totalAmount: amount,
-        depositAmount,
-        currency,
+        totalAmount: result.amount,
+        depositAmount: result.depositAmount,
+        depositHeld: result.depositAmount,
+        currency: result.currency,
+        guests,
         status: "confirmed",
       });
     } catch (error) {
-      if (saved) {
-        await db
-          .query("DELETE FROM reservations WHERE reservation_no = $1", [
-            reservationNo,
-          ])
-          .catch((err) => console.error(err));
-      }
-      if (holdId) await release(holdId).catch((err) => console.error(err));
-      if (depositId) {
-        await http
-          .post(`${billingUrl()}/refunds`, {
-            depositId,
-            amount: depositAmount,
-            currency,
-          })
-          .catch((err) => console.error(err));
+      if (error instanceof HttpError) {
+        return fail(res, error.status, error.error, error.message);
       }
       console.error(error);
       return next(error);
@@ -259,11 +498,7 @@ export function createApp({
 
     try {
       const result = await db.query(
-        `SELECT reservation_no AS "reservationNo", guest_id AS "guestId",
-                room_type_id AS "roomTypeId",
-                to_char(check_in, 'YYYY-MM-DD') AS "checkIn",
-                to_char(check_out, 'YYYY-MM-DD') AS "checkOut",
-                total_amount::float AS "totalAmount", currency, status
+        `SELECT ${reservationSelect}
          FROM reservations
          WHERE ($1::text IS NULL OR guest_id = $1)
            AND ($2::text IS NULL OR status = $2)
@@ -281,12 +516,7 @@ export function createApp({
   app.get("/reservations/:no", async (req, res, next) => {
     try {
       const result = await db.query(
-        `SELECT reservation_no AS "reservationNo", guest_id AS "guestId",
-                room_type_id AS "roomTypeId", check_in AS "checkIn",
-                check_out AS "checkOut", total_amount::float AS "totalAmount",
-                deposit_id AS "depositId", deposit_amount::float AS "depositAmount",
-                currency, status
-         FROM reservations WHERE reservation_no = $1`,
+        `SELECT ${reservationSelect} FROM reservations WHERE reservation_no = $1`,
         [req.params.no],
       );
 
@@ -298,10 +528,39 @@ export function createApp({
     }
   });
 
+  app.get("/reservations/:no/cancellation-quote", async (req, res, next) => {
+    try {
+      const reservation = await loadReservation(db, req.params.no);
+      if (!reservation) {
+        return fail(res, 404, "NotFound", "Reservation not found.");
+      }
+
+      const heldAmount = depositHeldValue(reservation);
+      const now = new Date();
+      const checkIn = new Date(`${reservation.checkIn}T00:00:00Z`);
+      const hoursBeforeCheckIn = Math.max(0, Math.round((checkIn.getTime() - now.getTime()) / 3_600_000));
+      const percent = cancellationPolicy.refundPercent(reservation.checkIn, now);
+      const refundAmount = Math.round((heldAmount * percent) * 100) / 10000;
+      const feeAmount = Math.round((heldAmount - refundAmount) * 100) / 100;
+
+      return res.status(200).json({
+        refundAmount,
+        feeAmount,
+        currency: currencyValue(reservation),
+        rule: cancellationPolicy.name || "full",
+        hoursBeforeCheckIn,
+      });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
   app.put("/reservations/:no", async (req, res, next) => {
     const { roomTypeId, checkIn, checkOut } = req.body ?? {};
+    const guests = parseGuests(req.body?.guests);
+    const actor = actorFromRequest(req);
 
-    if (!roomTypeId || !validDates(checkIn, checkOut)) {
+    if (!roomTypeId || !validDates(checkIn, checkOut) || guests === undefined) {
       return fail(
         res,
         400,
@@ -310,7 +569,6 @@ export function createApp({
       );
     }
 
-    let newHoldId;
     try {
       const found = await db.query(
         "SELECT * FROM reservations WHERE reservation_no = $1",
@@ -329,52 +587,156 @@ export function createApp({
         );
       }
 
-      const availabilityResult = await http.get(
-        `${roomRateUrl()}/availability`,
+      const currentHeld = depositHeldValue(current);
+
+      const result = await runSaga([
         {
-          params: { checkIn, checkOut, roomTypeId },
+          async execute() {
+            const availability = await findAvailability(
+              checkIn,
+              checkOut,
+              roomTypeId,
+              guests ?? current.guests,
+              current.hold_id,
+            );
+            if (!availability?.available || availability.roomsAvailable < 1) {
+              throw new HttpError(
+                409,
+                "Conflict",
+                "No rooms are available for those dates.",
+              );
+            }
+            const amount = totalPrice(availability.nightlyRate, checkIn, checkOut);
+            return {
+              amount,
+              delta: Math.round((amount - currentHeld) * 100) / 100,
+            };
+          },
         },
-      );
-      const availability = availabilityResult.data.availability?.find(
-        (item) => item.roomTypeId === roomTypeId,
-      );
+        {
+          async execute() {
+            const holdResult = await http.post(`${roomRateUrl()}/holds`, {
+              roomTypeId,
+              checkIn,
+              checkOut,
+              excludeHoldId: current.hold_id,
+            });
+            return { newHoldId: holdResult.data.id };
+          },
+          async compensate(ctx) {
+            await releaseHold(ctx.newHoldId);
+          },
+        },
+        {
+          async execute(ctx) {
+            await http.post(`${roomRateUrl()}/holds/${ctx.newHoldId}/confirm`);
+            if (ctx.delta > 0) {
+              const topUpPaymentId = await authorizeTopUp({
+                http,
+                reservationNo: req.params.no,
+                guestId: current.guest_id,
+                amount: ctx.delta,
+                currency: current.currency,
+              });
+              return { topUpPaymentId };
+            }
 
-      if (!availability?.available || availability.roomsAvailable < 1) {
-        return fail(
-          res,
-          409,
-          "Conflict",
-          "No rooms are available for those dates.",
-        );
-      }
+            if (ctx.delta < 0) {
+              const sources = await loadPaymentSources(db, current);
+              const refunds = await refundAcrossSources({
+                http,
+                reservationNo: req.params.no,
+                sources,
+                amount: Math.abs(ctx.delta),
+                currency: current.currency,
+              });
+              return { refunds };
+            }
 
-      const amount = totalPrice(availability.nightlyRate, checkIn, checkOut);
-      const holdResult = await http.post(`${roomRateUrl()}/holds`, {
-        roomTypeId,
-        checkIn,
-        checkOut,
-      });
-      newHoldId = holdResult.data.id;
+            return {};
+          },
+        },
+        {
+          async execute(ctx) {
+            const client = await db.connect();
+            try {
+              await client.query('BEGIN');
+              const newDepositHeld = Math.round((currentHeld + ctx.delta) * 100) / 100;
+              const updated = await client.query(
+                `UPDATE reservations
+                 SET room_type_id = $2, hold_id = $3, check_in = $4,
+                     check_out = $5, total_amount = $6, deposit_net = $7,
+                     guests = COALESCE($8, guests)
+                 WHERE reservation_no = $1
+                 RETURNING ${reservationSelect}`,
+                [
+                  req.params.no,
+                  roomTypeId,
+                  ctx.newHoldId,
+                  checkIn,
+                  checkOut,
+                  ctx.amount,
+                  newDepositHeld,
+                  guests,
+                ],
+              );
 
-      await http.post(`${roomRateUrl()}/holds/${newHoldId}/confirm`);
+              if (ctx.topUpPaymentId) {
+                await writeLedgerRow(client, {
+                  reservationNo: req.params.no,
+                  type: 'topup',
+                  billingPaymentId: ctx.topUpPaymentId,
+                  amount: ctx.delta,
+                  currency: current.currency,
+                  reason: 'modify_increase',
+                  actor,
+                });
+              }
 
-      const updated = await db.query(
-        `UPDATE reservations
-         SET room_type_id = $2, hold_id = $3, check_in = $4,
-             check_out = $5, total_amount = $6
-         WHERE reservation_no = $1
-         RETURNING reservation_no AS "reservationNo", guest_id AS "guestId",
-                   room_type_id AS "roomTypeId", check_in AS "checkIn",
-                   check_out AS "checkOut", total_amount::float AS "totalAmount",
-                   currency, status`,
-        [req.params.no, roomTypeId, newHoldId, checkIn, checkOut, amount],
-      );
+              if (ctx.refunds?.length) {
+                for (const refund of ctx.refunds) {
+                  await writeLedgerRow(client, {
+                    reservationNo: req.params.no,
+                    type: 'refund',
+                    billingPaymentId: refund.refundId,
+                    depositRef: refund.source.billingPaymentId,
+                    amount: refund.amount,
+                    currency: current.currency,
+                    reason: 'modify_decrease',
+                    actor,
+                  });
+                }
+              }
 
-      await release(current.hold_id);
-      return res.status(200).json(updated.rows[0]);
+              await client.query('COMMIT');
+              return { updated: updated.rows[0] };
+            } catch (error) {
+              await client.query('ROLLBACK').catch(() => {});
+              if (ctx.topUpPaymentId) {
+                await http.post(`${billingUrl()}/refunds`, {
+                  depositId: ctx.topUpPaymentId,
+                  amount: ctx.delta,
+                  currency: current.currency,
+                }).catch(() => {});
+              }
+              throw error;
+            } finally {
+              client.release();
+            }
+          },
+        },
+        {
+          async execute() {
+            await releaseHold(current.hold_id);
+          },
+        },
+      ]);
+
+      return res.status(200).json(result.updated);
     } catch (error) {
-      if (newHoldId)
-        await release(newHoldId).catch((err) => console.error(err));
+      if (error instanceof HttpError) {
+        return fail(res, error.status, error.error, error.message);
+      }
       console.error(error);
       return next(error);
     }
@@ -394,39 +756,64 @@ export function createApp({
         return fail(res, 409, "Conflict", "Reservation is already cancelled.");
       }
 
-      const percent = Number(process.env.CANCELLATION_REFUND_PERCENT ?? 100);
-      if (!Number.isFinite(percent) || percent < 0 || percent > 100) {
-        throw new Error(
-          "CANCELLATION_REFUND_PERCENT must be between 0 and 100.",
-        );
+      const actor = actorFromRequest(req);
+      const waiveFee = req.body?.waiveFee === true || req.body?.waiveFee === 'true';
+      if (waiveFee && actor.role !== 'manager') {
+        return fail(res, 403, "Forbidden", "Only managers can waive cancellation fees.");
       }
 
-      await release(reservation.hold_id);
-
-      const refundAmount =
-        Math.round(Number(reservation.deposit_amount) * percent) / 100;
-
-      if (refundAmount > 0 && reservation.deposit_id) {
-        try {
-          await http.post(`${billingUrl()}/refunds`, {
-            depositId: reservation.deposit_id,
-            amount: refundAmount,
-            currency: reservation.currency.trim(),
-          });
-        } catch (err) {
-          console.error(err);
-          const message =
-            err.response?.data?.message ||
-            err.response?.data?.error ||
-            err.message;
-          return fail(res, 502, "BillingError", message);
-        }
-      }
-
-      await db.query(
-        "UPDATE reservations SET status = 'cancelled' WHERE reservation_no = $1",
-        [req.params.no],
+      const heldAmount = depositHeldValue(reservation);
+      const percent = waiveFee ? 100 : cancellationPolicy.refundPercent(
+        reservation.check_in,
+        new Date(),
       );
+      const refundAmount = Math.round((heldAmount * percent) * 100) / 10000;
+      const feeAmount = Math.round((heldAmount - refundAmount) * 100) / 100;
+      const sources = refundAmount > 0 ? await loadPaymentSources(db, reservation) : [];
+      const refunds = refundAmount > 0
+        ? await refundAcrossSources({
+            http,
+            reservationNo: req.params.no,
+            sources,
+            amount: refundAmount,
+            currency: currencyValue(reservation),
+          })
+        : [];
+
+      const client = await db.connect();
+      try {
+        await client.query('BEGIN');
+        await client.query(
+          `UPDATE reservations
+           SET status = 'cancelled', cancelled_at = NOW(),
+               refund_amount = $2, cancellation_fee = $3,
+               deposit_net = $4
+           WHERE reservation_no = $1`,
+          [req.params.no, refundAmount, feeAmount, feeAmount],
+        );
+
+        for (const refund of refunds) {
+          await writeLedgerRow(client, {
+            reservationNo: req.params.no,
+            type: 'cancellation_refund',
+            billingPaymentId: refund.refundId,
+            depositRef: refund.source.billingPaymentId,
+            amount: refund.amount,
+            currency: currencyValue(reservation),
+            reason: waiveFee ? 'waived_fee' : 'policy',
+            actor,
+          });
+        }
+
+        await client.query('COMMIT');
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw error;
+      } finally {
+        client.release();
+      }
+
+      await releaseHold(reservation.hold_id);
       return res.status(204).end();
     } catch (error) {
       console.error(error);

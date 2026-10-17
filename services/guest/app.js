@@ -1,28 +1,35 @@
 import { randomUUID } from 'node:crypto';
 import express from 'express';
+import bcrypt from 'bcryptjs';
 import { pool } from './db.js';
+import { buildGuest } from './guest-builder.js';
 
 const guestFields = `
   id,
   email,
   first_name AS "firstName",
   last_name AS "lastName",
-  phone
+  phone,
+  address,
+  id_document AS "idDocument",
+  preferences,
+  loyalty_tier AS "loyaltyTier",
+  loyalty_number AS "loyaltyNumber",
+  consent_at AS "consentAt"
 `;
 
-function validGuest(body) {
-  return typeof body?.email === 'string' && body.email.trim() !== ''
-    && typeof body?.firstName === 'string' && body.firstName.trim() !== ''
-    && typeof body?.lastName === 'string' && body.lastName.trim() !== ''
-    && (body.phone == null || typeof body.phone === 'string');
-}
-
-function guestValues(body) {
+function guestRowValues(guest) {
   return [
-    body.email.trim().toLowerCase(),
-    body.firstName.trim(),
-    body.lastName.trim(),
-    body.phone?.trim() || null
+    guest.email,
+    guest.firstName,
+    guest.lastName,
+    guest.phone,
+    guest.address,
+    guest.idDocument,
+    guest.preferences,
+    guest.loyaltyTier,
+    guest.loyaltyNumber,
+    guest.consentAt
   ];
 }
 
@@ -34,18 +41,141 @@ function isUniqueViolation(error) {
   return error.code === '23505';
 }
 
+function internalTokenGuard(req, res, next) {
+  const required = process.env.INTERNAL_TOKEN;
+  if (!required) return next();
+  if (req.headers['x-internal-token'] !== required) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  return next();
+}
+
+function guestResponseFields(role = 'agent', requesterGuestId) {
+  const masked = role === 'manager' || role === 'guest';
+  return {
+    maskIdDocument: masked && requesterGuestId,
+  };
+}
+
+function maskDocument(value) {
+  if (typeof value !== 'string' || !value) return value ?? null;
+  const trimmed = value.trim();
+  if (trimmed.length <= 4) return '****';
+  return `${'*'.repeat(trimmed.length - 4)}${trimmed.slice(-4)}`;
+}
+
 export function createApp({ db = pool } = {}) {
   const app = express();
   app.use(express.json());
+  app.use(internalTokenGuard);
 
   app.get('/health', (_req, res) => res.status(200).json({ status: 'ok' }));
 
-  app.post('/guests/get-or-create', async (req, res, next) => {
-    if (!validGuest(req.body)) {
-      return errorResponse(res, 400, 'BadRequest', 'Valid email, firstName, and lastName are required.');
+  app.post('/auth/register', async (req, res, next) => {
+    const { password } = req.body ?? {};
+    const built = buildGuest(req.body);
+    if (built.error) {
+      return errorResponse(res, 400, 'BadRequest', built.error);
+    }
+    if (typeof password !== 'string' || password.length < 8) {
+      return errorResponse(res, 400, 'BadRequest', 'A password of at least 8 characters is required.');
     }
 
-    const [email, firstName, lastName, phone] = guestValues(req.body);
+    const guest = built.guest;
+    let client;
+
+    try {
+      client = await db.connect();
+      await client.query('BEGIN');
+      await client.query(
+        'SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))',
+        [guest.email, guest.phone ?? '']
+      );
+
+      const passwordHash = await bcrypt.hash(password, 10);
+      const found = await client.query(
+        `SELECT ${guestFields}, password_hash AS "passwordHash"
+         FROM guests
+         WHERE LOWER(email) = $1
+         LIMIT 1
+         FOR UPDATE`,
+        [guest.email]
+      );
+
+      if (found.rowCount) {
+        const updated = await client.query(
+          `UPDATE guests
+           SET first_name = $2, last_name = $3, phone = $4, address = $5,
+               id_document = $6, preferences = $7, loyalty_tier = $8,
+               loyalty_number = $9, consent_at = COALESCE($10::timestamptz, consent_at),
+               password_hash = $11, updated_at = NOW()
+           WHERE id = $1
+           RETURNING id AS "guestId", ${guestFields}`,
+          [found.rows[0].id, guest.firstName, guest.lastName, guest.phone, guest.address, guest.idDocument, guest.preferences, guest.loyaltyTier, guest.loyaltyNumber, guest.consentAt, passwordHash]
+        );
+        await client.query('COMMIT');
+        return res.status(200).json(updated.rows[0]);
+      }
+
+      const created = await client.query(
+        `INSERT INTO guests (
+           id, email, first_name, last_name, phone, address, id_document,
+           preferences, loyalty_tier, loyalty_number, consent_at, password_hash
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+         RETURNING id AS "guestId", ${guestFields}`,
+        [randomUUID(), guest.email, guest.firstName, guest.lastName, guest.phone, guest.address, guest.idDocument, guest.preferences, guest.loyaltyTier, guest.loyaltyNumber, guest.consentAt, passwordHash]
+      );
+
+      await client.query('COMMIT');
+      return res.status(201).json(created.rows[0]);
+    } catch (error) {
+      if (client) await client.query('ROLLBACK').catch(() => {});
+      return next(error);
+    } finally {
+      client?.release();
+    }
+  });
+
+  app.post('/auth/login', async (req, res, next) => {
+    const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
+    if (!email || !password) {
+      return errorResponse(res, 400, 'BadRequest', 'Valid email and password are required.');
+    }
+
+    try {
+      const result = await db.query(
+        `SELECT id AS "guestId", email, password_hash AS "passwordHash"
+         FROM guests WHERE LOWER(email) = $1`,
+        [email]
+      );
+      if (!result.rowCount || !result.rows[0].passwordHash) {
+        return errorResponse(res, 401, 'Unauthorized', 'Invalid credentials.');
+      }
+
+      const ok = await bcrypt.compare(password, result.rows[0].passwordHash);
+      if (!ok) {
+        return errorResponse(res, 401, 'Unauthorized', 'Invalid credentials.');
+      }
+
+      return res.status(200).json({
+        guestId: result.rows[0].guestId,
+        role: 'guest',
+        email: result.rows[0].email,
+      });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  app.post('/guests/get-or-create', async (req, res, next) => {
+    const built = buildGuest(req.body);
+    if (built.error) {
+      return errorResponse(res, 400, 'BadRequest', built.error);
+    }
+
+    const guest = built.guest;
     let client;
 
     try {
@@ -54,7 +184,7 @@ export function createApp({ db = pool } = {}) {
 
       await client.query(
         'SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))',
-        [email, phone ?? '']
+        [guest.email, guest.phone ?? '']
       );
 
       const found = await client.query(
@@ -65,7 +195,7 @@ export function createApp({ db = pool } = {}) {
                 AND REGEXP_REPLACE(COALESCE(phone, ''), '[^0-9]', '', 'g') = $2)
          LIMIT 1
          FOR UPDATE`,
-        [email, phone ? phone.replace(/\D/g, '') : null]
+        [guest.email, guest.phone ? guest.phone.replace(/\D/g, '') : null]
       );
 
       if (found.rowCount) {
@@ -74,10 +204,13 @@ export function createApp({ db = pool } = {}) {
       }
 
       const created = await client.query(
-        `INSERT INTO guests (id, email, first_name, last_name, phone)
-         VALUES ($1, $2, $3, $4, $5)
+        `INSERT INTO guests (
+           id, email, first_name, last_name, phone, address, id_document,
+           preferences, loyalty_tier, loyalty_number, consent_at
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
          RETURNING ${guestFields}`,
-        [randomUUID(), email, firstName, lastName, phone]
+        [randomUUID(), ...guestRowValues(guest)]
       );
 
       await client.query('COMMIT');
@@ -85,7 +218,7 @@ export function createApp({ db = pool } = {}) {
     } catch (error) {
       if (client) await client.query('ROLLBACK').catch(() => {});
       if (isUniqueViolation(error)) {
-        return errorResponse(res, 409, 'Conflict', 'A guest with that email or phone already exists.');
+        return errorResponse(res, 409, 'Conflict', 'A guest with that email, phone, or loyalty number already exists.');
       }
       return next(error);
     } finally {
@@ -107,6 +240,7 @@ export function createApp({ db = pool } = {}) {
             OR first_name ILIKE $1
             OR last_name ILIKE $1
             OR COALESCE(phone, '') ILIKE $1
+            OR COALESCE(loyalty_number, '') ILIKE $1
          ORDER BY last_name, first_name, id`,
         [`%${query}%`]
       );
@@ -117,20 +251,75 @@ export function createApp({ db = pool } = {}) {
     }
   });
 
-  app.put('/guests/:id', async (req, res, next) => {
-    if (!validGuest(req.body)) {
-      return errorResponse(res, 400, 'BadRequest', 'Valid email, firstName, and lastName are required.');
+  app.get('/guests', async (req, res, next) => {
+    const ids = typeof req.query.ids === 'string' ? req.query.ids.split(',').map((item) => item.trim()).filter(Boolean) : [];
+    if (!ids.length) {
+      return errorResponse(res, 400, 'BadRequest', 'A non-empty ids query parameter is required.');
     }
 
     try {
-      const [email, firstName, lastName, phone] = guestValues(req.body);
+      const result = await db.query(
+        `SELECT id, first_name AS "firstName", last_name AS "lastName", email, phone
+         FROM guests WHERE id = ANY($1::uuid[]) ORDER BY last_name, first_name, id`,
+        [ids]
+      );
+      return res.status(200).json({ guests: result.rows });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  app.get('/guests/:id/export', async (req, res, next) => {
+    try {
+      const result = await db.query(
+        `SELECT ${guestFields} FROM guests WHERE id = $1`,
+        [req.params.id]
+      );
+      if (!result.rowCount) {
+        return errorResponse(res, 404, 'NotFound', 'Guest not found.');
+      }
+      return res.status(200).json({
+        guest: result.rows[0],
+        exportedAt: new Date().toISOString()
+      });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  app.get('/guests/:id', async (req, res, next) => {
+    try {
+      const result = await db.query(
+        `SELECT ${guestFields} FROM guests WHERE id = $1`,
+        [req.params.id]
+      );
+      if (!result.rowCount) {
+        return errorResponse(res, 404, 'NotFound', 'Guest not found.');
+      }
+      return res.status(200).json(result.rows[0]);
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  app.put('/guests/:id', async (req, res, next) => {
+    const built = buildGuest(req.body);
+    if (built.error) {
+      return errorResponse(res, 400, 'BadRequest', built.error);
+    }
+
+    try {
+      const guest = built.guest;
       const result = await db.query(
         `UPDATE guests
          SET email = $2, first_name = $3, last_name = $4, phone = $5,
+             address = $6, id_document = $7, preferences = $8,
+             loyalty_tier = $9, loyalty_number = $10,
+             consent_at = COALESCE($11::timestamptz, consent_at),
              updated_at = NOW()
          WHERE id = $1
          RETURNING ${guestFields}`,
-        [req.params.id, email, firstName, lastName, phone]
+        [req.params.id, ...guestRowValues(guest)]
       );
 
       if (!result.rowCount) {
@@ -139,8 +328,23 @@ export function createApp({ db = pool } = {}) {
       return res.status(200).json(result.rows[0]);
     } catch (error) {
       if (isUniqueViolation(error)) {
-        return errorResponse(res, 409, 'Conflict', 'A guest with that email or phone already exists.');
+        return errorResponse(res, 409, 'Conflict', 'A guest with that email, phone, or loyalty number already exists.');
       }
+      return next(error);
+    }
+  });
+
+  app.delete('/guests/:id', async (req, res, next) => {
+    try {
+      const result = await db.query(
+        'DELETE FROM guests WHERE id = $1 RETURNING id',
+        [req.params.id]
+      );
+      if (!result.rowCount) {
+        return errorResponse(res, 404, 'NotFound', 'Guest not found.');
+      }
+      return res.status(204).end();
+    } catch (error) {
       return next(error);
     }
   });

@@ -6,8 +6,12 @@ CREATE TABLE IF NOT EXISTS hotels (
 CREATE TABLE IF NOT EXISTS room_types (
   id TEXT PRIMARY KEY,
   hotel_id TEXT NOT NULL REFERENCES hotels(id),
-  name TEXT NOT NULL
+  name TEXT NOT NULL,
+  max_occupancy INT NOT NULL DEFAULT 2 CHECK (max_occupancy >= 1)
 );
+
+ALTER TABLE room_types ADD COLUMN IF NOT EXISTS max_occupancy INT;
+UPDATE room_types SET max_occupancy = 2 WHERE max_occupancy IS NULL;
 
 CREATE TABLE IF NOT EXISTS rate_plans (
   id TEXT PRIMARY KEY,

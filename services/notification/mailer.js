@@ -6,3 +6,11 @@ export async function sendEmail({ to, subject, text }) {
     text
   }));
 }
+
+export async function sendSms({ to, text }) {
+  console.info(JSON.stringify({
+    type: 'test-sms',
+    to,
+    text
+  }));
+}

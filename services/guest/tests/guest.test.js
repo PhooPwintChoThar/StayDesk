@@ -96,6 +96,61 @@ describe('guest endpoints', () => {
     });
   });
 
+  it('stores profile extras, exports them, and deletes the guest', async () => {
+    const created = await request(app).post('/guests/get-or-create').send({
+      email: 'loyalty@example.com',
+      firstName: 'Loyal',
+      lastName: 'Guest',
+      address: '12 Market Street',
+      idDocument: 'P1234567',
+      preferences: 'High floor',
+      loyaltyTier: 'gold',
+      loyaltyNumber: 'GOLD-1',
+      consent: true
+    });
+
+    expect(created.status).toBe(201);
+    expect(created.body).toMatchObject({
+      address: '12 Market Street',
+      loyaltyTier: 'gold',
+      loyaltyNumber: 'GOLD-1'
+    });
+
+    const found = await request(app).get('/guests/search').query({ q: 'GOLD-1' });
+    expect(found.body.guests).toHaveLength(1);
+
+    const exported = await request(app).get(`/guests/${created.body.id}/export`);
+    expect(exported.status).toBe(200);
+    expect(exported.body.guest.email).toBe('loyalty@example.com');
+    expect(exported.body.exportedAt).toBeDefined();
+
+    const deleted = await request(app).delete(`/guests/${created.body.id}`);
+    expect(deleted.status).toBe(204);
+  });
+
+  it('registers and logs in a guest with a password', async () => {
+    const registered = await request(app).post('/auth/register').send({
+      email: 'auth@example.com',
+      password: 'secret123',
+      firstName: 'Auth',
+      lastName: 'Guest'
+    });
+
+    expect(registered.status).toBe(201);
+    expect(registered.body.guestId).toEqual(expect.any(String));
+
+    const loggedIn = await request(app).post('/auth/login').send({
+      email: 'auth@example.com',
+      password: 'secret123'
+    });
+
+    expect(loggedIn.status).toBe(200);
+    expect(loggedIn.body).toMatchObject({
+      guestId: registered.body.guestId,
+      role: 'guest'
+    });
+  });
+
   it('returns 404 when updating an unknown guest', async () => {
     const response = await request(app).put('/guests/00000000-0000-0000-0000-000000000001').send({
       email: 'missing@example.com',

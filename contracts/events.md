@@ -10,6 +10,9 @@ Published by the reservation service after the room hold is confirmed and the de
 |---|---|---|
 | `reservationNo` | string | Reservation identifier |
 | `guestId` | string | Guest identifier |
+| `guestEmail` | string | Guest email used for confirmation, when known |
+| `guestPhone` | string | Guest phone used for SMS confirmation, when known |
+| `channel` | string | `email` or `sms` |
 | `roomTypeId` | string | Reserved room type |
 | `checkIn` | string | Check-in date in `YYYY-MM-DD` format |
 | `checkOut` | string | Check-out date in `YYYY-MM-DD` format |

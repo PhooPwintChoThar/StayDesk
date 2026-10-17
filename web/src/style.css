@@ -659,6 +659,24 @@ select {
   border-radius: 14px;
 }
 
+.lookup-actions {
+  display: flex;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.consent-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  grid-column: 1 / -1;
+}
+
+.consent-row input {
+  width: auto;
+  min-height: 0;
+}
+
 .error {
   margin: 8px 0 0;
   padding: 0.8rem 1rem;

@@ -28,6 +28,11 @@ paths:
           in: query
           schema:
             type: string
+        - name: excludeHoldId
+          in: query
+          description: Optional hold id to exclude from availability counts during a modify flow.
+          schema:
+            type: string
       responses:
         "200":
           description: Available room types and rates
@@ -64,6 +69,8 @@ paths:
                 checkOut:
                   type: string
                   format: date
+                excludeHoldId:
+                  type: string
       responses:
         "201":
           description: Room hold created
@@ -350,6 +357,31 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+    get:
+      operationId: getReservationCancellationQuote
+      tags: [reservation]
+      responses:
+        "200":
+          description: Quote for cancelling the reservation
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [refundAmount, feeAmount, currency, rule, hoursBeforeCheckIn]
+                properties:
+                  refundAmount:
+                    type: number
+                  feeAmount:
+                    type: number
+                  currency:
+                    type: string
+                    pattern: "^[A-Z]{3}$"
+                  rule:
+                    type: string
+                  hoursBeforeCheckIn:
+                    type: integer
+        "404":
+          $ref: "#/components/responses/NotFound"
     delete:
       operationId: cancelReservation
       tags: [reservation]
@@ -462,7 +494,7 @@ components:
 
     Reservation:
       type: object
-      required: [reservationNo, guestId, roomTypeId, checkIn, checkOut, totalAmount, depositAmount, currency, status]
+      required: [reservationNo, guestId, roomTypeId, checkIn, checkOut, totalAmount, depositAmount, depositHeld, currency, status]
       properties:
         reservationNo:
           type: string
@@ -479,6 +511,8 @@ components:
         totalAmount:
           type: number
         depositAmount:
+          type: number
+        depositHeld:
           type: number
         currency:
           type: string

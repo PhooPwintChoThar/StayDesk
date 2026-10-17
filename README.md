@@ -17,11 +17,11 @@ Booking saga: check availability -> hold room (10 min) -> get-or-create guest ->
 | Service | Host port | Database |
 |---|---|---|
 | gateway | 3010 (container 3000) | none |
-| guest | 3001 | guest_db |
-| reservation | 3002 | reservation_db |
-| room-rate | 3003 | room_rate_db |
-| billing | 3004 | payment_db |
-| notification | 3005 | notification_db |
+| guest | 127.0.0.1:3001 | guest_db |
+| reservation | 127.0.0.1:3002 | reservation_db |
+| room-rate | 127.0.0.1:3003 | room_rate_db |
+| billing | 127.0.0.1:3004 | payment_db |
+| notification | 127.0.0.1:3005 | notification_db |
 | postgres | 55432 (container 5432) | one server, one DB per service |
 | rabbitmq | 5672, UI 15672 (guest / guest) | none |
 | web (Vite) | 5173 | none |
@@ -71,7 +71,7 @@ Quick check: `curl http://localhost:3010/health` should return `{"status":"ok"}`
 
 ## Authentication (dev only)
 
-The gateway validates JWTs and enforces roles (`guest`, `agent`, `manager`). There is no real user database, so `POST /login {"role":"agent"}` returns a token for that role. The web app calls it automatically (`web/src/api.js`). `GET /availability` is public.
+The gateway validates JWTs and enforces roles (`guest`, `agent`, `manager`). It supports credential login with `POST /login {"username","password"}` and guest registration with `POST /auth/register`. The old role-based `POST /login {"role":"agent"}` path stays available while `ALLOW_DEV_LOGIN=true` for demos and tests; set it to `false` in production. If `INTERNAL_TOKEN` is set, the backend services require it on internal calls.
 
 ## Day-to-day commands
 
@@ -122,10 +122,10 @@ docker-compose.yml
 
 ## Known issues and open items
 
-- Modify checks availability before releasing the old hold, so shifting to overlapping dates on a 1-room type returns 409.
-- Billing and the payment gateway are stubs; the deposit is not adjusted when a modification changes the price.
-- Notification only logs a test email. No templates.
+- Billing and the payment gateway are stubs (Adapter); the deposit is not adjusted when a modification changes the price.
+- Notification logs a test email or SMS. No template management.
 - Production security and scaling are described in the report as the target design, not implemented.
+- Cancellation uses a strategy (`CANCELLATION_POLICY=full|partial|none`). Partial refunds 50% when check-in is at least two days away.
 
 ## Troubleshooting
 

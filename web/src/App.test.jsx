@@ -212,8 +212,9 @@ describe("role switcher and guests page", () => {
       "guest",
     );
 
-    expect(await screen.findByRole("alert")).toHaveTextContent(
-      "Guests cannot view the booking register",
+    expect(await screen.findByLabelText("Confirmation number")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.queryByText("R-STORED")).not.toBeInTheDocument(),
     );
     const logins = calls("POST", "/login").map(
       ([, options]) => JSON.parse(options.body).role,
@@ -242,7 +243,10 @@ describe("role switcher and guests page", () => {
 
     render(<App />);
     await userEvent.click(screen.getByRole("button", { name: /Guests$/ }));
-    await userEvent.type(screen.getByLabelText("Name, email or phone"), "test");
+    await userEvent.type(
+      screen.getByLabelText("Name, email, phone or loyalty number"),
+      "test",
+    );
     await userEvent.click(
       screen.getByRole("button", { name: "Search guests" }),
     );

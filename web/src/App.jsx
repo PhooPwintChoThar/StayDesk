@@ -1,8 +1,26 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { apiRequest, setRole as setApiRole } from "./api.js";
 
-const initialSearch = { checkIn: "", checkOut: "", roomTypeId: "" };
-const initialGuest = { email: "", firstName: "", lastName: "", phone: "" };
+const initialSearch = {
+  checkIn: "",
+  checkOut: "",
+  roomTypeId: "",
+  hotelId: "",
+  guests: "1",
+};
+const initialGuest = {
+  email: "",
+  firstName: "",
+  lastName: "",
+  phone: "",
+  address: "",
+  idDocument: "",
+  preferences: "",
+  loyaltyTier: "none",
+  loyaltyNumber: "",
+  consent: false,
+  channel: "email",
+};
 const initialFilters = { from: "", to: "", status: "", roomTypeId: "", q: "" };
 
 const ROLES = [
@@ -64,9 +82,14 @@ export default function App() {
   const [guests, setGuests] = useState([]);
   const [selectedGuest, setSelectedGuest] = useState(null);
   const [guestReservations, setGuestReservations] = useState([]);
+  const [hotels, setHotels] = useState([]);
+  const [lookupNo, setLookupNo] = useState("");
+  const [lookedUp, setLookedUp] = useState(null);
 
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const roleRef = useRef(role);
+  roleRef.current = role;
 
   const loadReservations = useCallback(async () => {
     const params = new URLSearchParams();
@@ -76,20 +99,20 @@ export default function App() {
 
     try {
       const result = await apiRequest(`/reservations?${params}`);
+      if (roleRef.current === "guest") {
+        setReservations([]);
+        return;
+      }
       setReservations(result.reservations || []);
     } catch (err) {
       setReservations([]);
-      setError(
-        role === "guest"
-          ? "Guests cannot view the booking register. Use + New Reservation to book."
-          : err.message,
-      );
+      if (roleRef.current !== "guest") setError(err.message);
     }
-  }, [filters.status, filters.from, filters.to, role]);
+  }, [filters.status, filters.from, filters.to]);
 
   useEffect(() => {
     if (view === "reservations") loadReservations();
-  }, [view, loadReservations]);
+  }, [view, loadReservations, role]);
 
   function changeRole(nextRole) {
     setApiRole(nextRole);
@@ -98,6 +121,12 @@ export default function App() {
     setGuests([]);
     setSelectedGuest(null);
     setGuestReservations([]);
+    setLookedUp(null);
+    setLookupNo("");
+    if (nextRole === "guest") {
+      setView("reservations");
+      setReservations([]);
+    }
   }
 
   function openBooking() {
@@ -109,6 +138,9 @@ export default function App() {
     setGuest(initialGuest);
     setConfirmation(null);
     setError("");
+    apiRequest("/hotels")
+      .then((result) => setHotels(result.hotels || []))
+      .catch(() => setHotels([]));
   }
 
   async function searchRooms(event) {
@@ -125,6 +157,8 @@ export default function App() {
         checkOut: search.checkOut,
       });
       if (search.roomTypeId) params.set("roomTypeId", search.roomTypeId);
+      if (search.hotelId) params.set("hotelId", search.hotelId);
+      if (search.guests) params.set("guests", search.guests);
 
       const result = await apiRequest(`/availability?${params}`);
       setAvailability(result.availability || []);
@@ -145,10 +179,23 @@ export default function App() {
       const reservation = await apiRequest("/reservations", {
         method: "POST",
         body: JSON.stringify({
-          guest,
+          guest: {
+            email: guest.email,
+            firstName: guest.firstName,
+            lastName: guest.lastName,
+            phone: guest.phone,
+            address: guest.address,
+            idDocument: guest.idDocument,
+            preferences: guest.preferences,
+            loyaltyTier: guest.loyaltyTier,
+            loyaltyNumber: guest.loyaltyNumber,
+            consent: guest.consent,
+          },
           roomTypeId: selectedRoom.roomTypeId,
           checkIn: search.checkIn,
           checkOut: search.checkOut,
+          guests: Number(search.guests) || undefined,
+          channel: guest.channel,
         }),
       });
       setConfirmation(reservation);
@@ -172,8 +219,26 @@ export default function App() {
         method: "DELETE",
       });
       await loadReservations();
+      if (lookedUp?.reservationNo === reservationNo) setLookedUp(null);
     } catch (err) {
       setError(err.message);
+    }
+  }
+
+  async function lookupReservation(event) {
+    event.preventDefault();
+    setError("");
+    setLookedUp(null);
+    setBusy(true);
+    try {
+      const reservation = await apiRequest(
+        `/reservations/${encodeURIComponent(lookupNo.trim())}`,
+      );
+      setLookedUp(reservation);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -207,6 +272,9 @@ export default function App() {
       );
       setEditing(null);
       await loadReservations();
+      if (lookedUp?.reservationNo === editing.reservationNo) {
+        setLookedUp(null);
+      }
     } catch (err) {
       setError(err.message);
     } finally {
@@ -243,6 +311,43 @@ export default function App() {
       setGuestReservations(result.reservations || []);
     } catch (err) {
       setGuestReservations([]);
+      setError(err.message);
+    }
+  }
+
+  async function exportGuest(guestId) {
+    setError("");
+    try {
+      const result = await apiRequest(
+        `/guests/${encodeURIComponent(guestId)}/export`,
+      );
+      const blob = new Blob([JSON.stringify(result, null, 2)], {
+        type: "application/json",
+      });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `guest-${guestId}.json`;
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  async function deleteGuest(guestId) {
+    if (!window.confirm("Permanently delete this guest profile?")) return;
+    setError("");
+    try {
+      await apiRequest(`/guests/${encodeURIComponent(guestId)}`, {
+        method: "DELETE",
+      });
+      setGuests((current) => current.filter((item) => item.id !== guestId));
+      if (selectedGuest?.id === guestId) {
+        setSelectedGuest(null);
+        setGuestReservations([]);
+      }
+    } catch (err) {
       setError(err.message);
     }
   }
@@ -296,11 +401,13 @@ export default function App() {
           <button type="button" className="nav-item" disabled title="Coming soon">
             <Icon name="rooms" /><span>Rooms</span>
           </button>
-          <button type="button"
-                  className={`nav-item ${view === "guests" ? "active" : ""}`}
-                  onClick={() => { setView("guests"); setError(""); }}>
-            <Icon name="guests" /><span>Guests</span>
-          </button>
+          {role !== "guest" && (
+            <button type="button"
+                    className={`nav-item ${view === "guests" ? "active" : ""}`}
+                    onClick={() => { setView("guests"); setError(""); }}>
+              <Icon name="guests" /><span>Guests</span>
+            </button>
+          )}
           <button type="button" className="nav-item" disabled title="Coming soon">
             <Icon name="housekeeping" /><span>Housekeeping</span>
           </button>
@@ -357,6 +464,64 @@ export default function App() {
 
         {view === "reservations" && (
           <>
+            <section className="register-panel" aria-labelledby="lookup-heading">
+              <div className="register-header">
+                <div>
+                  <h2 id="lookup-heading">Look up a reservation</h2>
+                  <p className="muted">Find a booking by confirmation number</p>
+                </div>
+              </div>
+              <form onSubmit={lookupReservation} className="form-grid">
+                <label>
+                  Confirmation number
+                  <input
+                    required
+                    value={lookupNo}
+                    onChange={(event) => setLookupNo(event.target.value)}
+                    placeholder="R-…"
+                  />
+                </label>
+                <button disabled={busy} type="submit" className="primary-action">
+                  Find reservation
+                </button>
+              </form>
+              {lookedUp && (
+                <div className="confirmation-card" role="status">
+                  <p>
+                    <strong>{lookedUp.reservationNo}</strong>
+                    {" · "}
+                    {lookedUp.roomTypeId}
+                    {" · "}
+                    {day(lookedUp.checkIn)} to {day(lookedUp.checkOut)}
+                    {" · "}
+                    {lookedUp.totalAmount} {lookedUp.currency}
+                  </p>
+                  <span className={`status-pill ${lookedUp.status}`}>
+                    {lookedUp.status}
+                  </span>
+                  {lookedUp.status === "confirmed" && (
+                    <div className="lookup-actions">
+                      <button
+                        type="button"
+                        className="page-btn"
+                        onClick={() => startModify(lookedUp)}
+                      >
+                        Modify
+                      </button>
+                      <button
+                        type="button"
+                        className="page-btn"
+                        onClick={() => cancelReservation(lookedUp.reservationNo)}
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+            </section>
+
+            {role !== "guest" && (
             <section className="kpi-grid" aria-label="Booking summary">
               <article className="kpi-card kpi-primary">
                 <div className="kpi-top"><span>Total bookings</span>
@@ -384,6 +549,7 @@ export default function App() {
                 <small>{revenueCurrency || "—"} total</small>
               </article>
             </section>
+            )}
             {bookingOpen && (
               <section
                 aria-labelledby="new-reservation-heading"
@@ -425,6 +591,34 @@ export default function App() {
                     />
                   </label>
                   <label>
+                    Hotel (optional)
+                    <select
+                      value={search.hotelId}
+                      onChange={(event) =>
+                        setSearch({ ...search, hotelId: event.target.value })
+                      }
+                    >
+                      <option value="">All hotels</option>
+                      {hotels.map((hotel) => (
+                        <option key={hotel.id} value={hotel.id}>
+                          {hotel.name}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    Guests
+                    <input
+                      type="number"
+                      min="1"
+                      required
+                      value={search.guests}
+                      onChange={(event) =>
+                        setSearch({ ...search, guests: event.target.value })
+                      }
+                    />
+                  </label>
+                  <label>
                     Room type ID (optional)
                     <input
                       value={search.roomTypeId}
@@ -447,11 +641,14 @@ export default function App() {
                     {availability.map((room) => (
                       <li key={room.roomTypeId}>
                         <span>
-                          {room.roomTypeId} —{" "}
+                          {room.name || room.roomTypeId} —{" "}
                           {room.roomsAvailable ??
                             (room.available ? "Available" : "Unavailable")}
                           {" · "}
                           {room.nightlyRate} {room.currency} per night
+                          {room.maxOccupancy
+                            ? ` · up to ${room.maxOccupancy} guests`
+                            : ""}
                         </span>
                         <button
                           type="button"
@@ -517,6 +714,94 @@ export default function App() {
                             setGuest({ ...guest, phone: event.target.value })
                           }
                         />
+                      </label>
+                      <label>
+                        Address (optional)
+                        <input
+                          value={guest.address}
+                          onChange={(event) =>
+                            setGuest({ ...guest, address: event.target.value })
+                          }
+                        />
+                      </label>
+                      <label>
+                        ID document (optional)
+                        <input
+                          value={guest.idDocument}
+                          onChange={(event) =>
+                            setGuest({
+                              ...guest,
+                              idDocument: event.target.value,
+                            })
+                          }
+                        />
+                      </label>
+                      <label>
+                        Preferences (optional)
+                        <input
+                          value={guest.preferences}
+                          onChange={(event) =>
+                            setGuest({
+                              ...guest,
+                              preferences: event.target.value,
+                            })
+                          }
+                        />
+                      </label>
+                      <label>
+                        Loyalty tier
+                        <select
+                          value={guest.loyaltyTier}
+                          onChange={(event) =>
+                            setGuest({
+                              ...guest,
+                              loyaltyTier: event.target.value,
+                            })
+                          }
+                        >
+                          <option value="none">None</option>
+                          <option value="member">Member</option>
+                          <option value="silver">Silver</option>
+                          <option value="gold">Gold</option>
+                          <option value="platinum">Platinum</option>
+                        </select>
+                      </label>
+                      <label>
+                        Loyalty number (optional)
+                        <input
+                          value={guest.loyaltyNumber}
+                          onChange={(event) =>
+                            setGuest({
+                              ...guest,
+                              loyaltyNumber: event.target.value,
+                            })
+                          }
+                        />
+                      </label>
+                      <label>
+                        Confirmation channel
+                        <select
+                          value={guest.channel}
+                          onChange={(event) =>
+                            setGuest({ ...guest, channel: event.target.value })
+                          }
+                        >
+                          <option value="email">Email</option>
+                          <option value="sms">SMS</option>
+                        </select>
+                      </label>
+                      <label className="consent-row">
+                        <input
+                          type="checkbox"
+                          checked={guest.consent}
+                          onChange={(event) =>
+                            setGuest({
+                              ...guest,
+                              consent: event.target.checked,
+                            })
+                          }
+                        />
+                        Store my profile and send booking confirmations
                       </label>
                       <button
                         disabled={busy}
@@ -610,6 +895,7 @@ export default function App() {
               </section>
             )}
 
+            {role !== "guest" && (
             <section className="register-panel">
               <div className="register-header">
                 <div>
@@ -788,6 +1074,18 @@ export default function App() {
                 </span>
               </div>
             </section>
+            )}
+            {role === "guest" && !bookingOpen && (
+              <div className="register-panel">
+                <button
+                  type="button"
+                  className="primary-action"
+                  onClick={openBooking}
+                >
+                  + New Reservation
+                </button>
+              </div>
+            )}
           </>
         )}
 
@@ -798,7 +1096,7 @@ export default function App() {
             </div>
             <form onSubmit={searchGuests} className="form-grid">
               <label>
-                Name, email or phone
+                Name, email, phone or loyalty number
                 <input
                   required
                   value={guestQuery}
@@ -853,6 +1151,29 @@ export default function App() {
                   Stay history: {selectedGuest.firstName}{" "}
                   {selectedGuest.lastName}
                 </h3>
+                <p className="muted">
+                  {selectedGuest.loyaltyTier || "none"}
+                  {selectedGuest.loyaltyNumber
+                    ? ` · ${selectedGuest.loyaltyNumber}`
+                    : ""}
+                  {selectedGuest.address ? ` · ${selectedGuest.address}` : ""}
+                </p>
+                <div className="lookup-actions">
+                  <button
+                    type="button"
+                    className="page-btn"
+                    onClick={() => exportGuest(selectedGuest.id)}
+                  >
+                    Export profile
+                  </button>
+                  <button
+                    type="button"
+                    className="page-btn"
+                    onClick={() => deleteGuest(selectedGuest.id)}
+                  >
+                    Delete profile
+                  </button>
+                </div>
                 {guestReservations.length === 0 ? (
                   <p>No reservations for this guest.</p>
                 ) : (

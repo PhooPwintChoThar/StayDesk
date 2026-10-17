@@ -1,6 +1,6 @@
 import { app } from './app.js';
 import { startConsumer } from './consumer.js';
-import { sendEmail } from './mailer.js';
+import { sendEmail, sendSms } from './mailer.js';
 
 const amqp = await import('amqplib');
 const connection = await amqp.connect(
@@ -8,7 +8,7 @@ const connection = await amqp.connect(
 );
 const channel = await connection.createChannel();
 
-await startConsumer(channel, { sendEmail });
+await startConsumer(channel, { sendEmail, sendSms });
 
 const port = process.env.PORT || 3000;
 const server = app.listen(port, () => {

@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import nock from "nock";
 import request from "supertest";
 import { createApp } from "../app.js";
+import { createCancellationPolicy } from "../cancellation-policy.js";
 import { pool } from "../db.js";
 import { jest } from "@jest/globals";
 
@@ -26,7 +27,7 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
-  await pool.query("TRUNCATE reservations");
+  await pool.query("TRUNCATE reservation_payments, reservations CASCADE");
   nock.cleanAll();
 });
 
@@ -90,10 +91,22 @@ describe("reservation endpoints", () => {
       }),
     );
     const stored = await pool.query(
-      "SELECT deposit_amount::float AS \"depositAmount\", currency FROM reservations WHERE reservation_no = $1",
+      "SELECT deposit_amount::float AS \"depositAmount\", deposit_net::float AS \"depositHeld\", currency FROM reservations WHERE reservation_no = $1",
       [response.body.reservationNo],
     );
-    expect(stored.rows[0]).toEqual({ depositAmount: 60, currency: "USD" });
+    expect(stored.rows[0]).toEqual({ depositAmount: 60, depositHeld: 60, currency: "USD" });
+
+    const ledger = await pool.query(
+      "SELECT type, billing_payment_id AS \"billingPaymentId\", amount::float AS amount FROM reservation_payments WHERE reservation_no = $1 ORDER BY created_at",
+      [response.body.reservationNo],
+    );
+    expect(ledger.rows).toEqual([
+      {
+        type: 'deposit',
+        billingPaymentId: 'deposit-1',
+        amount: 60,
+      },
+    ]);
   });
 
   it("releases the hold and returns 402 when billing declines", async () => {
@@ -161,6 +174,59 @@ describe("reservation endpoints", () => {
       ["R-CANCEL"],
     );
     expect(row.rows[0].status).toBe("cancelled");
+  });
+
+  it("returns a cancellation quote without calling billing", async () => {
+    await pool.query(
+      `INSERT INTO reservations
+        (reservation_no, guest_id, room_type_id, hold_id, check_in, check_out,
+         total_amount, deposit_id, deposit_amount, deposit_net, currency, status)
+       VALUES ('R-QUOTE', 'guest-1', 'standard', 'hold-quote', $1, $2,
+               200, 'deposit-quote', 50, 50, 'USD', 'confirmed')`,
+      [dates.checkIn, dates.checkOut],
+    );
+
+    const response = await request(createApp({
+      db: pool,
+      publishEvent: jest.fn(),
+      cancellationPolicy: createCancellationPolicy({ name: "full", refundPercent: 100 }),
+    }))
+      .get('/reservations/R-QUOTE/cancellation-quote');
+
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({
+      refundAmount: 50,
+      feeAmount: 0,
+      currency: 'USD',
+    });
+  });
+
+  it("skips the refund when the none cancellation policy is configured", async () => {
+    await pool.query(
+      `INSERT INTO reservations
+        (reservation_no, guest_id, room_type_id, hold_id, check_in, check_out,
+         total_amount, deposit_id, deposit_amount, currency, status)
+       VALUES ('R-NO-REFUND', 'guest-1', 'standard', 'hold-none', $1, $2,
+               200, 'deposit-none', 50, 'USD', 'confirmed')`,
+      [dates.checkIn, dates.checkOut],
+    );
+
+    const release = nock(roomRate).delete("/holds/hold-none").reply(204);
+
+    const response = await request(
+      createApp({
+        db: pool,
+        publishEvent: jest.fn(),
+        cancellationPolicy: createCancellationPolicy({ name: "none" }),
+      }),
+    ).delete("/reservations/R-NO-REFUND");
+
+    expect(response.status).toBe(204);
+    expect(release.isDone()).toBe(true);
+    expect(
+      (await pool.query("SELECT status FROM reservations WHERE reservation_no = 'R-NO-REFUND'"))
+        .rows[0].status,
+    ).toBe("cancelled");
   });
 
   it("continues cancellation and refunds when the hold is not found", async () => {
@@ -270,5 +336,78 @@ describe("reservation endpoints", () => {
     expect(response.status).toBe(409);
     expect(availability.isDone()).toBe(true);
     expect(nock.isDone()).toBe(true);
+  });
+
+  it("modifies a reservation by excluding the current hold from the new availability check", async () => {
+    await pool.query(
+      `INSERT INTO reservations
+        (reservation_no, guest_id, room_type_id, hold_id, check_in, check_out,
+         total_amount, deposit_amount, currency, status)
+       VALUES ('R-MODIFY-SWAP', 'guest-1', 'standard', 'hold-existing', $1, $2,
+               200, 50, 'USD', 'confirmed')`,
+      [dates.checkIn, dates.checkOut],
+    );
+
+    const availability = nock(roomRate)
+      .get('/availability')
+      .query((query) =>
+        query.roomTypeId === 'standard' &&
+        query.checkIn === '2027-03-20' &&
+        query.checkOut === '2027-03-22' &&
+        query.excludeHoldId === 'hold-existing',
+      )
+      .reply(200, {
+        availability: [
+          {
+            roomTypeId: 'standard',
+            available: true,
+            roomsAvailable: 1,
+            nightlyRate: 125,
+            currency: 'USD',
+          },
+        ],
+      });
+
+    const hold = nock(roomRate)
+      .post('/holds', (body) =>
+        body.roomTypeId === 'standard' &&
+        body.checkIn === '2027-03-20' &&
+        body.checkOut === '2027-03-22' &&
+        body.excludeHoldId === 'hold-existing',
+      )
+      .reply(201, { id: 'hold-new' });
+
+    nock(roomRate).post('/holds/hold-new/confirm').reply(200, { status: 'confirmed' });
+    const topUp = nock(billing)
+      .post('/deposits', (body) =>
+        body.reservationNo === 'R-MODIFY-SWAP' &&
+        body.guestId === 'guest-1' &&
+        body.amount === 200 &&
+        body.currency === 'USD',
+      )
+      .reply(201, { id: 'deposit-topup', status: 'authorized' });
+    const release = nock(roomRate).delete('/holds/hold-existing').reply(204);
+
+    const response = await request(
+      createApp({ db: pool, publishEvent: jest.fn() }),
+    )
+      .put('/reservations/R-MODIFY-SWAP')
+      .send({
+        roomTypeId: 'standard',
+        checkIn: '2027-03-20',
+        checkOut: '2027-03-22',
+      });
+
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({
+      reservationNo: 'R-MODIFY-SWAP',
+      checkIn: '2027-03-20',
+      checkOut: '2027-03-22',
+      depositHeld: 250,
+    });
+    expect(availability.isDone()).toBe(true);
+    expect(hold.isDone()).toBe(true);
+    expect(topUp.isDone()).toBe(true);
+    expect(release.isDone()).toBe(true);
   });
 });

@@ -25,6 +25,20 @@ describe('ReservationConfirmed consumer', () => {
     }));
   });
 
+  it('sends an SMS when the event asks for that channel', async () => {
+    const notifier = {
+      sendEmail: jest.fn(),
+      sendSms: jest.fn().mockResolvedValue(undefined)
+    };
+
+    await handleReservationConfirmed({ ...event, channel: 'sms' }, notifier);
+
+    expect(notifier.sendSms).toHaveBeenCalledWith(expect.objectContaining({
+      text: 'Reservation confirmed: R-10001'
+    }));
+    expect(notifier.sendEmail).not.toHaveBeenCalled();
+  });
+
   it('rejects malformed event payloads', async () => {
     const mailer = { sendEmail: jest.fn() };
 

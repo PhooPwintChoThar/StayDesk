@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import express from 'express';
 import { pool } from './db.js';
+import { createPaymentGateway } from './payment-gateway.js';
 
 function validMoney(amount) {
   return Number.isFinite(amount) && amount > 0 && Math.round(amount * 100) === amount * 100;
@@ -14,9 +15,20 @@ function errorResponse(res, status, error, message) {
   return res.status(status).json({ error, message });
 }
 
-export function createApp({ db = pool, getPaymentMode = () => process.env.PAYMENT_MODE } = {}) {
+export function createApp({
+  db = pool,
+  paymentGateway
+} = {}) {
   const app = express();
   app.use(express.json());
+  app.use((req, res, next) => {
+    const required = process.env.INTERNAL_TOKEN;
+    if (!required || req.headers['x-internal-token'] === required) return next();
+    return res.status(401).json({ error: 'Unauthorized' });
+  });
+
+  const gatewayForRequest = () =>
+    paymentGateway ?? createPaymentGateway(process.env.PAYMENT_MODE);
 
   app.get('/health', (_req, res) => res.status(200).json({ status: 'ok' }));
 
@@ -29,8 +41,13 @@ export function createApp({ db = pool, getPaymentMode = () => process.env.PAYMEN
 
     try {
       const id = randomUUID();
-      const declined = getPaymentMode() === 'decline';
-      const status = declined ? 'declined' : 'authorized';
+      const decision = gatewayForRequest().authorize({
+        reservationNo,
+        guestId,
+        amount,
+        currency
+      });
+      const status = decision.approved ? 'authorized' : 'declined';
 
       await db.query(
         `INSERT INTO payments (id, type, reservation_no, guest_id, amount, currency, status)
@@ -38,10 +55,10 @@ export function createApp({ db = pool, getPaymentMode = () => process.env.PAYMEN
         [id, reservationNo, guestId, amount, currency, status]
       );
 
-      if (declined) {
+      if (!decision.approved) {
         return res.status(402).json({
           error: 'PaymentDeclined',
-          message: 'The deposit was declined.'
+          message: decision.reason || 'The deposit was declined.'
         });
       }
 

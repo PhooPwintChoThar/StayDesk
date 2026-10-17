@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import express from 'express';
 import { pool } from './db.js';
+import { canTransition } from './hold-state.js';
 
 const HOLD_DURATION_MS = 10 * 60 * 1000;
 
@@ -24,10 +25,13 @@ function errorResponse(res, status, error, message) {
   return res.status(status).json({ error, message });
 }
 
-async function getAvailability(db, checkIn, checkOut, now, roomTypeId) {
+async function getAvailability(db, checkIn, checkOut, now, { roomTypeId, hotelId, guests, excludeHoldId } = {}) {
   const result = await db.query(
     `SELECT
        rt.id AS "roomTypeId",
+       rt.name AS "name",
+       rt.hotel_id AS "hotelId",
+       rt.max_occupancy AS "maxOccupancy",
        COALESCE(rate.nightly_rate, 0)::float AS "nightlyRate",
        COALESCE(rate.currency, 'USD') AS currency,
        (
@@ -39,6 +43,7 @@ async function getAvailability(db, checkIn, checkOut, now, roomTypeId) {
          SELECT COUNT(*)::int
          FROM holds h
          WHERE h.room_type_id = rt.id
+           AND ($7::text IS NULL OR h.id <> $7)
            AND h.check_in < $2::date
            AND h.check_out > $1::date
            AND (
@@ -55,14 +60,19 @@ async function getAvailability(db, checkIn, checkOut, now, roomTypeId) {
        LIMIT 1
      ) rate ON TRUE
      WHERE ($4::text IS NULL OR rt.id = $4)
+       AND ($5::text IS NULL OR rt.hotel_id = $5)
+       AND ($6::int IS NULL OR rt.max_occupancy >= $6)
      ORDER BY rt.id`,
-    [checkIn, checkOut, now, roomTypeId ?? null]
+    [checkIn, checkOut, now, roomTypeId ?? null, hotelId ?? null, guests ?? null, excludeHoldId ?? null]
   );
 
   return result.rows.map((row) => {
     const roomsAvailable = Math.max(0, row.roomCount - row.occupied);
     return {
       roomTypeId: row.roomTypeId,
+      name: row.name,
+      hotelId: row.hotelId,
+      maxOccupancy: row.maxOccupancy,
       available: roomsAvailable > 0,
       roomsAvailable,
       nightlyRate: row.nightlyRate,
@@ -74,14 +84,37 @@ async function getAvailability(db, checkIn, checkOut, now, roomTypeId) {
 export function createApp({ db = pool, clock = () => new Date() } = {}) {
   const app = express();
   app.use(express.json());
+  app.use((req, res, next) => {
+    const required = process.env.INTERNAL_TOKEN;
+    if (!required || req.headers['x-internal-token'] === required) return next();
+    return res.status(401).json({ error: 'Unauthorized' });
+  });
 
   app.get('/health', (_req, res) => res.status(200).json({ status: 'ok' }));
 
+  app.get('/hotels', async (_req, res, next) => {
+    try {
+      const result = await db.query(
+        'SELECT id, name FROM hotels ORDER BY name, id'
+      );
+      return res.status(200).json({ hotels: result.rows });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
   app.get('/availability', async (req, res, next) => {
-    const { checkIn, checkOut, roomTypeId } = req.query;
+    const { checkIn, checkOut, roomTypeId, hotelId, excludeHoldId } = req.query;
+    const guests = req.query.guests === undefined || req.query.guests === ''
+      ? null
+      : Number(req.query.guests);
 
     if (!validDateRange(checkIn, checkOut)) {
       return errorResponse(res, 400, 'BadRequest', 'Valid checkIn and checkOut dates are required.');
+    }
+
+    if (guests != null && (!Number.isInteger(guests) || guests < 1)) {
+      return errorResponse(res, 400, 'BadRequest', 'guests must be a positive integer.');
     }
 
     try {
@@ -90,7 +123,7 @@ export function createApp({ db = pool, clock = () => new Date() } = {}) {
         checkIn,
         checkOut,
         clock().toISOString(),
-        roomTypeId
+        { roomTypeId, hotelId, guests, excludeHoldId: typeof excludeHoldId === 'string' ? excludeHoldId : null }
       );
       return res.status(200).json({ availability });
     } catch (error) {
@@ -99,7 +132,7 @@ export function createApp({ db = pool, clock = () => new Date() } = {}) {
   });
 
   app.post('/holds', async (req, res, next) => {
-    const { roomTypeId, checkIn, checkOut } = req.body ?? {};
+    const { roomTypeId, checkIn, checkOut, excludeHoldId } = req.body ?? {};
 
     if (!roomTypeId || !validDateRange(checkIn, checkOut)) {
       return errorResponse(res, 400, 'BadRequest', 'roomTypeId and a valid date range are required.');
@@ -135,7 +168,7 @@ export function createApp({ db = pool, clock = () => new Date() } = {}) {
         checkIn,
         checkOut,
         now.toISOString(),
-        roomTypeId
+        { roomTypeId, excludeHoldId: typeof excludeHoldId === 'string' ? excludeHoldId : null }
       );
 
       if (!availability || availability.roomsAvailable < 1) {
@@ -181,13 +214,18 @@ export function createApp({ db = pool, clock = () => new Date() } = {}) {
       const hold = selected.rows[0];
       const now = clock();
 
-      if (hold.status !== 'held' || new Date(hold.expires_at) <= now) {
-        if (hold.status === 'held') {
-          await client.query("UPDATE holds SET status = 'expired' WHERE id = $1", [hold.id]);
-          await client.query('COMMIT');
-        } else {
+      if (hold.status === 'held' && new Date(hold.expires_at) <= now) {
+        if (!canTransition(hold.status, 'expired')) {
           await client.query('ROLLBACK');
+          return errorResponse(res, 409, 'Conflict', 'Hold is no longer active.');
         }
+        await client.query("UPDATE holds SET status = 'expired' WHERE id = $1", [hold.id]);
+        await client.query('COMMIT');
+        return errorResponse(res, 409, 'Conflict', 'Hold is no longer active.');
+      }
+
+      if (!canTransition(hold.status, 'confirmed')) {
+        await client.query('ROLLBACK');
         return errorResponse(res, 409, 'Conflict', 'Hold is no longer active.');
       }
 
@@ -211,15 +249,14 @@ export function createApp({ db = pool, clock = () => new Date() } = {}) {
 
   app.delete('/holds/:id', async (req, res, next) => {
     try {
-      const released = await db.query(
-        "UPDATE holds SET status = 'released' WHERE id = $1 AND status IN ('held', 'confirmed') RETURNING id",
-        [req.params.id]
-      );
-      if (released.rowCount) return res.status(204).end();
+      const current = await db.query('SELECT status FROM holds WHERE id = $1', [req.params.id]);
+      if (!current.rowCount) return errorResponse(res, 404, 'NotFound', 'Hold not found.');
+      if (!canTransition(current.rows[0].status, 'released')) {
+        return errorResponse(res, 409, 'Conflict', 'Hold already released.');
+      }
 
-      const exists = await db.query('SELECT 1 FROM holds WHERE id = $1', [req.params.id]);
-      if (!exists.rowCount) return errorResponse(res, 404, 'NotFound', 'Hold not found.');
-      return errorResponse(res, 409, 'Conflict', 'Hold already released.');
+      await db.query("UPDATE holds SET status = 'released' WHERE id = $1", [req.params.id]);
+      return res.status(204).end();
     } catch (error) {
       return next(error);
     }

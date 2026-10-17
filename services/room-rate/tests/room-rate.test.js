@@ -66,6 +66,25 @@ describe('room-rate endpoints', () => {
     });
   });
 
+  it('excludes a specified hold from availability counts', async () => {
+    const created = await request(app).post('/holds').send({
+      roomTypeId: 'test-room-type',
+      checkIn,
+      checkOut
+    });
+
+    expect(created.status).toBe(201);
+
+    const response = await request(app)
+      .get('/availability')
+      .query({ checkIn, checkOut, excludeHoldId: created.body.id });
+
+    expect(response.body.availability[0]).toMatchObject({
+      available: true,
+      roomsAvailable: 1
+    });
+  });
+
   it('stops counting a hold after its 10-minute expiry', async () => {
     const created = await request(app).post('/holds').send({
       roomTypeId: 'test-room-type',
@@ -95,6 +114,27 @@ describe('room-rate endpoints', () => {
     ]);
 
     expect(responses.map(({ status }) => status).sort()).toEqual([201, 409]);
+  });
+
+  it('filters availability by hotel and occupancy', async () => {
+    await pool.query(`
+      INSERT INTO room_types (id, hotel_id, name, max_occupancy)
+      VALUES ('family-room', 'test-hotel', 'Family', 4)
+    `);
+
+    const byGuests = await request(app)
+      .get('/availability')
+      .query({ checkIn, checkOut, guests: 3 });
+
+    expect(byGuests.status).toBe(200);
+    expect(byGuests.body.availability.map((row) => row.roomTypeId)).toEqual([
+      'family-room'
+    ]);
+
+    const hotels = await request(app).get('/hotels');
+    expect(hotels.body.hotels).toEqual([
+      expect.objectContaining({ id: 'test-hotel', name: 'Test Hotel' })
+    ]);
   });
 
   it('confirms and releases a hold', async () => {
