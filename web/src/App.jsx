@@ -10,6 +10,8 @@ import {
   setRole as setDevRole,
   subscribeSession,
 } from "./api.js";
+import MyProfileScreen from "./MyProfileScreen.jsx";
+import PaymentsScreen from "./PaymentsScreen.jsx";
 
 const DEV_ROLE_SWITCH = import.meta.env.VITE_DEV_ROLE_SWITCH === "true";
 
@@ -28,7 +30,6 @@ const initialGuest = {
   address: "",
   idDocument: "",
   preferences: "",
-  loyaltyTier: "none",
   loyaltyNumber: "",
   consent: false,
   channel: "email",
@@ -41,6 +42,31 @@ const ROLES = [
   { value: "manager", label: "Manager", initials: "M" },
 ];
 
+// Views each role may open. Real authorization lives in the gateway; this only
+// decides what the UI renders and shows in the sidebar.
+const ALLOWED_VIEWS = {
+  guest: ["reservations", "payments", "profile"],
+  agent: ["reservations", "guests", "payments"],
+  manager: ["reservations", "guests", "payments"],
+};
+
+const NAV_ITEMS = {
+  reservations: { label: "Reservations", icon: "calendar" },
+  guests: { label: "Guests", icon: "guests" },
+  payments: { label: "Payments", icon: "billing" },
+  profile: { label: "My profile", icon: "guests" },
+};
+
+function viewHeading(view, role) {
+  if (view === "payments") return { eyebrow: "Billing", title: "Payments" };
+  if (view === "profile") return { eyebrow: "Guest services", title: "My profile" };
+  if (view === "guests") return { eyebrow: "Guest services", title: "Guest Lookup" };
+  if (role === "guest") {
+    return { eyebrow: "Guest services", title: "Book a room / My bookings" };
+  }
+  return { eyebrow: "Front desk", title: "Reservations Management" };
+}
+
 const day = (value) => String(value ?? "").slice(0, 10);
 
 function nights(checkIn, checkOut) {
@@ -51,14 +77,9 @@ function nights(checkIn, checkOut) {
 }
 
 const ICONS = {
-  dashboard: "M4 4h6v6H4z M14 4h6v6h-6z M4 14h6v6H4z M14 14h6v6h-6z",
   calendar: "M5 5h14v15H5z M5 10h14 M9 3v4 M15 3v4",
-  rooms: "M3 11l9-7 9 7 M5 10v10h14V10 M10 20v-6h4v6",
   guests: "M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8z M4 20c0-4 4-6 8-6s8 2 8 6",
-  housekeeping: "M12 3v4 M12 17v4 M3 12h4 M17 12h4 M6 6l2.5 2.5 M15.5 15.5L18 18 M18 6l-2.5 2.5 M8.5 15.5L6 18",
   billing: "M3 6h18v12H3z M3 10h18 M7 15h4",
-  reports: "M5 20V10 M12 20V4 M19 20v-7",
-  settings: "M4 7h9 M17 7h3 M4 17h3 M11 17h9 M13 4v6 M7 14v6",
   check: "M5 12l4 4 10-10",
   close: "M6 6l12 12 M18 6L6 18",
   cash: "M12 3v18 M16 7c0-2-2-3-4-3s-4 1-4 3 2 3 4 3 4 1 4 3-2 3-4 3-4-1-4-3",
@@ -229,17 +250,8 @@ export default function App() {
   const [hotels, setHotels] = useState([]);
   const [lookupNo, setLookupNo] = useState("");
   const [lookedUp, setLookedUp] = useState(null);
-  const [myProfile, setMyProfile] = useState(null);
-  const [myProfileError, setMyProfileError] = useState("");
-  const [myProfileBusy, setMyProfileBusy] = useState(false);
-  const [paymentReservationNo, setPaymentReservationNo] = useState("");
-  const [paymentSummary, setPaymentSummary] = useState(null);
-  const [paymentProofs, setPaymentProofs] = useState([]);
-  const [paymentNote, setPaymentNote] = useState("");
-  const [paymentAmount, setPaymentAmount] = useState("");
-  const [paymentFile, setPaymentFile] = useState(null);
-  const [paymentBusy, setPaymentBusy] = useState(false);
-  const [paymentError, setPaymentError] = useState("");
+  const [tierDraft, setTierDraft] = useState("none");
+  const [tierBusy, setTierBusy] = useState(false);
 
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -272,6 +284,17 @@ export default function App() {
 
   const role = session?.claims?.role || (DEV_ROLE_SWITCH ? getDevRole() : null);
   const currentRole = ROLES.find((item) => item.value === role) || ROLES[0];
+
+  // View guard: whatever the stored view is (after login, logout, a role change
+  // or manipulated state), a view the role may not open falls back to
+  // "reservations". Rendering below always uses activeView, never raw view.
+  const allowedViews = Object.hasOwn(ALLOWED_VIEWS, role)
+    ? ALLOWED_VIEWS[role]
+    : ["reservations"];
+  const activeView = allowedViews.includes(view) ? view : "reservations";
+  useEffect(() => {
+    if (view !== activeView) setView(activeView);
+  }, [view, activeView]);
 
   async function handleSignIn(event) {
     event.preventDefault();
@@ -307,18 +330,26 @@ export default function App() {
     }
   }
 
-  function handleLogout() {
-    logout();
-    setSession(null);
-    setView("reservations");
+  function resetWorkspace() {
     setError("");
     setAuthError("");
-    setReservations([]);
     setGuests([]);
     setSelectedGuest(null);
     setGuestReservations([]);
     setLookedUp(null);
     setLookupNo("");
+    setOpenMenu(null);
+    setEditing(null);
+    setBookingOpen(false);
+    setConfirmation(null);
+  }
+
+  function handleLogout() {
+    logout();
+    setSession(null);
+    setView("reservations");
+    setReservations([]);
+    resetWorkspace();
   }
 
   const loadReservations = useCallback(async () => {
@@ -335,75 +366,17 @@ export default function App() {
       setReservations(result.reservations || []);
     } catch (err) {
       setReservations([]);
-      if (sessionRef.current?.claims?.role !== "guest") setError(err.message);
+      setError(err.message);
     }
   }, [filters.status, filters.from, filters.to]);
 
-  const loadMyProfile = useCallback(async () => {
-    if (!sessionRef.current?.claims?.guestId) return;
-    setMyProfileBusy(true);
-    setMyProfileError("");
-    try {
-      const result = await apiRequest(`/guests/${encodeURIComponent(sessionRef.current.claims.guestId)}`);
-      setMyProfile(result);
-    } catch (err) {
-      setMyProfileError(err.message);
-    } finally {
-      setMyProfileBusy(false);
-    }
-  }, []);
-
-  const loadPayments = useCallback(async () => {
-    setPaymentError("");
-    setPaymentSummary(null);
-    setPaymentProofs([]);
-
-    try {
-      if (sessionRef.current?.claims?.role === "guest") {
-        const guestReservations = await apiRequest(`/reservations?guestId=${encodeURIComponent(sessionRef.current.claims.guestId)}`);
-        const firstReservation = guestReservations.reservations?.[0]?.reservationNo || "";
-        if (!firstReservation) return;
-        setPaymentReservationNo(firstReservation);
-        const [summary, proofs] = await Promise.all([
-          apiRequest(`/reservations/${encodeURIComponent(firstReservation)}/payment-summary`),
-          apiRequest(`/payments/proofs?reservationNo=${encodeURIComponent(firstReservation)}`),
-        ]);
-        setPaymentSummary(summary);
-        setPaymentProofs(proofs.proofs || []);
-      } else {
-        const proofs = await apiRequest('/payments/proofs?status=pending');
-        setPaymentProofs(proofs.proofs || []);
-      }
-    } catch (err) {
-      setPaymentError(err.message);
-    }
-  }, []);
-
   useEffect(() => {
-    if (session && view === "reservations") loadReservations();
-  }, [session, view, loadReservations]);
-
-  useEffect(() => {
-    if (session && view === "profile" && session.claims.role === "guest") {
-      loadMyProfile();
-    }
-  }, [session, view, loadMyProfile]);
-
-  useEffect(() => {
-    if (session && view === "payments") {
-      loadPayments();
-    }
-  }, [session, view, loadPayments]);
+    if (session && activeView === "reservations") loadReservations();
+  }, [session, activeView, loadReservations]);
 
   async function changeRole(nextRole) {
     setDevRole(nextRole);
-    setError("");
-    setAuthError("");
-    setGuests([]);
-    setSelectedGuest(null);
-    setGuestReservations([]);
-    setLookedUp(null);
-    setLookupNo("");
+    resetWorkspace();
     if (nextRole === "guest") {
       setView("reservations");
       setReservations([]);
@@ -473,7 +446,6 @@ export default function App() {
             address: guest.address,
             idDocument: guest.idDocument,
             preferences: guest.preferences,
-            loyaltyTier: guest.loyaltyTier,
             loyaltyNumber: guest.loyaltyNumber,
             consent: guest.consent,
           },
@@ -487,7 +459,7 @@ export default function App() {
       setConfirmation(reservation);
       setSelectedRoom(null);
       setAvailability([]);
-      if (role !== "guest") await loadReservations();
+      await loadReservations();
     } catch (err) {
       setError(err.message);
     } finally {
@@ -497,13 +469,36 @@ export default function App() {
 
   async function cancelReservation(reservationNo) {
     setOpenMenu(null);
-    if (!window.confirm(`Cancel reservation ${reservationNo}?`)) return;
-
     setError("");
+
+    const path = `/reservations/${encodeURIComponent(reservationNo)}`;
+    let message = `Cancel reservation ${reservationNo}?`;
+    let feeAmount = 0;
     try {
-      await apiRequest(`/reservations/${encodeURIComponent(reservationNo)}`, {
-        method: "DELETE",
-      });
+      const quote = await apiRequest(`${path}/cancellation-quote`);
+      const hasQuote =
+        quote &&
+        quote.refundAmount != null &&
+        quote.feeAmount != null &&
+        Number.isFinite(Number(quote.refundAmount)) &&
+        Number.isFinite(Number(quote.feeAmount));
+      if (hasQuote) {
+        feeAmount = Number(quote.feeAmount);
+        message = `Refund ${quote.refundAmount} ${quote.currency}, fee ${quote.feeAmount} ${quote.currency} (rule ${quote.rule}). ${message}`;
+      }
+    } catch {
+      // Quote unavailable: fall back to the plain confirmation message.
+    }
+    if (!window.confirm(message)) return;
+
+    const options = { method: "DELETE" };
+    // Only managers are offered the waiver (the gateway enforces it as well).
+    if (role === "manager" && feeAmount > 0 && window.confirm("Waive the cancellation fee?")) {
+      options.body = JSON.stringify({ waiveFee: true });
+    }
+
+    try {
+      await apiRequest(path, options);
       await loadReservations();
       if (lookedUp?.reservationNo === reservationNo) setLookedUp(null);
     } catch (err) {
@@ -590,6 +585,7 @@ export default function App() {
   async function showGuest(selected) {
     setError("");
     setSelectedGuest(selected);
+    setTierDraft(selected.loyaltyTier || "none");
     try {
       const result = await apiRequest(
         `/reservations?guestId=${encodeURIComponent(selected.id)}`,
@@ -638,103 +634,43 @@ export default function App() {
     }
   }
 
-  async function saveMyProfile(event) {
+  // Manager-only. The UI hides this for everyone else; the gateway enforces it.
+  async function saveGuestTier(event) {
     event.preventDefault();
-    if (!myProfile) return;
+    if (!selectedGuest || role !== "manager") return;
 
-    setMyProfileBusy(true);
-    setMyProfileError("");
+    setError("");
+    setTierBusy(true);
     try {
-      const result = await apiRequest(`/guests/${encodeURIComponent(myProfile.id)}`, {
-        method: "PUT",
-        body: JSON.stringify({
-          email: myProfile.email,
-          firstName: myProfile.firstName,
-          lastName: myProfile.lastName,
-          phone: myProfile.phone || "",
-          address: myProfile.address || "",
-          idDocument: myProfile.idDocument || "",
-          preferences: myProfile.preferences || "",
-          loyaltyTier: myProfile.loyaltyTier || "none",
-          loyaltyNumber: myProfile.loyaltyNumber || "",
-          consent: true,
-        }),
-      });
-      setMyProfile(result);
-    } catch (err) {
-      setMyProfileError(err.message);
-    } finally {
-      setMyProfileBusy(false);
-    }
-  }
-
-  async function uploadProof(event) {
-    event.preventDefault();
-    if (!paymentReservationNo || !paymentFile) return;
-
-    setPaymentBusy(true);
-    setPaymentError("");
-    try {
-      const token = session?.token;
-      const formData = new FormData();
-      formData.append("reservationNo", paymentReservationNo);
-      formData.append("amount", paymentAmount || "0");
-      formData.append("currency", paymentSummary?.currency || "USD");
-      formData.append("note", paymentNote);
-      formData.append("file", paymentFile);
-
-      const response = await fetch(`${(import.meta.env.VITE_API_BASE_URL || "http://localhost:3010").replace(/\/$/, "")}/payments/proofs`, {
-        method: "POST",
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
-        body: formData,
-      });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data.message || data.error || "Upload failed");
-      setPaymentFile(null);
-      setPaymentNote("");
-      setPaymentAmount("");
-      await loadPayments();
-    } catch (err) {
-      setPaymentError(err.message);
-    } finally {
-      setPaymentBusy(false);
-    }
-  }
-
-  async function reviewProof(proofId, decision) {
-    setPaymentError("");
-    try {
-      const body = { decision };
-      if (decision === "rejected") {
-        const note = window.prompt("Rejection note");
-        if (!note) return;
-        body.note = note;
+      const body = { loyaltyTier: tierDraft };
+      for (const field of [
+        "email",
+        "firstName",
+        "lastName",
+        "phone",
+        "address",
+        "idDocument",
+        "preferences",
+        "loyaltyNumber",
+      ]) {
+        if (selectedGuest[field] != null) body[field] = selectedGuest[field];
       }
-      await apiRequest(`/payments/proofs/${encodeURIComponent(proofId)}/review`, {
-        method: "PUT",
-        body: JSON.stringify(body),
-      });
-      await loadPayments();
+      const updated = await apiRequest(
+        `/guests/${encodeURIComponent(selectedGuest.id)}`,
+        { method: "PUT", body: JSON.stringify(body) },
+      );
+      const tier = updated?.loyaltyTier ?? tierDraft;
+      setSelectedGuest((current) => (current ? { ...current, loyaltyTier: tier } : current));
+      setGuests((current) =>
+        current.map((item) =>
+          item.id === selectedGuest.id ? { ...item, loyaltyTier: tier } : item,
+        ),
+      );
+      setTierDraft(tier);
     } catch (err) {
-      setPaymentError(err.message);
-    }
-  }
-
-  async function openProofFile(proofId) {
-    try {
-      const response = await fetch(`${(import.meta.env.VITE_API_BASE_URL || "http://localhost:3010").replace(/\/$/, "")}/payments/proofs/${encodeURIComponent(proofId)}/file`, {
-        headers: session?.token ? { Authorization: `Bearer ${session.token}` } : {},
-      });
-      if (!response.ok) {
-        const data = await response.json().catch(() => ({}));
-        throw new Error(data.message || data.error || "Unable to open file");
-      }
-      const blob = await response.blob();
-      const url = URL.createObjectURL(blob);
-      window.open(url, "_blank", "noopener,noreferrer");
-      setTimeout(() => URL.revokeObjectURL(url), 10_000);
-    } catch (err) {
-      setPaymentError(err.message);
+      setError(err.message);
+    } finally {
+      setTierBusy(false);
     }
   }
 
@@ -780,6 +716,8 @@ export default function App() {
     );
   }
 
+  const heading = viewHeading(activeView, role);
+
   return (
     <main className="page-shell">
       <aside className="sidebar">
@@ -790,36 +728,21 @@ export default function App() {
 
         <div className="nav-caption">Menu</div>
         <nav className="nav" aria-label="Sidebar navigation">
-          <button type="button" className="nav-item" disabled title="Coming soon">
-            <Icon name="dashboard" /><span>Dashboard</span>
-          </button>
-          <button type="button"
-                  className={`nav-item ${view === "reservations" ? "active" : ""}`}
-                  onClick={() => { setView("reservations"); setError(""); }}>
-            <Icon name="calendar" /><span>Reservations</span>
-          </button>
-          <button type="button" className="nav-item" disabled title="Coming soon">
-            <Icon name="rooms" /><span>Rooms</span>
-          </button>
-          {role !== "guest" && (
-            <button type="button"
-                    className={`nav-item ${view === "guests" ? "active" : ""}`}
-                    onClick={() => { setView("guests"); setError(""); }}>
-              <Icon name="guests" /><span>Guests</span>
+          {allowedViews.map((item) => (
+            <button
+              key={item}
+              type="button"
+              className={`nav-item ${activeView === item ? "active" : ""}`}
+              aria-current={activeView === item ? "page" : undefined}
+              onClick={() => {
+                setView(item);
+                setError("");
+              }}
+            >
+              <Icon name={NAV_ITEMS[item].icon} />
+              <span>{NAV_ITEMS[item].label}</span>
             </button>
-          )}
-          <button type="button" className="nav-item" disabled title="Coming soon">
-            <Icon name="housekeeping" /><span>Housekeeping</span>
-          </button>
-          <button type="button" className="nav-item" disabled title="Coming soon">
-            <Icon name="billing" /><span>Billing</span>
-          </button>
-          <button type="button" className="nav-item" disabled title="Coming soon">
-            <Icon name="reports" /><span>Reports</span>
-          </button>
-          <button type="button" className="nav-item" disabled title="Coming soon">
-            <Icon name="settings" /><span>Settings</span>
-          </button>
+          ))}
         </nav>
 
         <div className="user-card">
@@ -856,10 +779,8 @@ export default function App() {
       <div className="main-panel">
         <header className="topbar">
           <div>
-            <p className="eyebrow">{view === "reservations" ? "Front desk" : "Guest services"}</p>
-            <div className="page-title">
-              {view === "reservations" ? "Reservations Management" : "Guest Lookup"}
-            </div>
+            <p className="eyebrow">{heading.eyebrow}</p>
+            <div className="page-title">{heading.title}</div>
           </div>
           <div className="topbar-right">
             <div className="system-date">System Date: {today}</div>
@@ -873,7 +794,7 @@ export default function App() {
           </p>
         )}
 
-        {view === "reservations" && (
+        {activeView === "reservations" && (
           <>
             <section className="register-panel" aria-labelledby="lookup-heading">
               <div className="register-header">
@@ -1160,24 +1081,6 @@ export default function App() {
                         />
                       </label>
                       <label>
-                        Loyalty tier
-                        <select
-                          value={guest.loyaltyTier}
-                          onChange={(event) =>
-                            setGuest({
-                              ...guest,
-                              loyaltyTier: event.target.value,
-                            })
-                          }
-                        >
-                          <option value="none">None</option>
-                          <option value="member">Member</option>
-                          <option value="silver">Silver</option>
-                          <option value="gold">Gold</option>
-                          <option value="platinum">Platinum</option>
-                        </select>
-                      </label>
-                      <label>
                         Loyalty number (optional)
                         <input
                           value={guest.loyaltyNumber}
@@ -1306,12 +1209,15 @@ export default function App() {
               </section>
             )}
 
-            {role !== "guest" && (
             <section className="register-panel">
               <div className="register-header">
                 <div>
-                  <h2>Active Booking Register</h2>
-                  <p className="muted">Review, modify or cancel guest stays</p>
+                  <h2>{role === "guest" ? "My bookings" : "Active Booking Register"}</h2>
+                  <p className="muted">
+                    {role === "guest"
+                      ? "Review, modify or cancel your stays"
+                      : "Review, modify or cancel guest stays"}
+                  </p>
                 </div>
                 <button
                   type="button"
@@ -1485,22 +1391,10 @@ export default function App() {
                 </span>
               </div>
             </section>
-            )}
-            {role === "guest" && !bookingOpen && (
-              <div className="register-panel">
-                <button
-                  type="button"
-                  className="primary-action"
-                  onClick={openBooking}
-                >
-                  + New Reservation
-                </button>
-              </div>
-            )}
           </>
         )}
 
-        {view === "guests" && (
+        {activeView === "guests" && (
           <section aria-labelledby="guests-heading" className="register-panel">
             <div className="register-header">
               <h2 id="guests-heading">Find a guest</h2>
@@ -1563,7 +1457,7 @@ export default function App() {
                   {selectedGuest.lastName}
                 </h3>
                 <p className="muted">
-                  {selectedGuest.loyaltyTier || "none"}
+                  Loyalty tier: {selectedGuest.loyaltyTier || "none"}
                   {selectedGuest.loyaltyNumber
                     ? ` · ${selectedGuest.loyaltyNumber}`
                     : ""}
@@ -1577,14 +1471,43 @@ export default function App() {
                   >
                     Export profile
                   </button>
-                  <button
-                    type="button"
-                    className="page-btn"
-                    onClick={() => deleteGuest(selectedGuest.id)}
-                  >
-                    Delete profile
-                  </button>
+                  {role === "manager" && (
+                    <button
+                      type="button"
+                      className="page-btn"
+                      onClick={() => deleteGuest(selectedGuest.id)}
+                    >
+                      Delete profile
+                    </button>
+                  )}
                 </div>
+                {role === "manager" && (
+                  <form onSubmit={saveGuestTier} className="form-grid">
+                    <label>
+                      Loyalty tier
+                      <select
+                        value={tierDraft}
+                        onChange={(event) => setTierDraft(event.target.value)}
+                      >
+                        <option value="none">None</option>
+                        <option value="member">Member</option>
+                        <option value="silver">Silver</option>
+                        <option value="gold">Gold</option>
+                        <option value="platinum">Platinum</option>
+                      </select>
+                    </label>
+                    <button
+                      type="submit"
+                      className="primary-action"
+                      disabled={
+                        tierBusy ||
+                        tierDraft === (selectedGuest.loyaltyTier || "none")
+                      }
+                    >
+                      Save tier
+                    </button>
+                  </form>
+                )}
                 {guestReservations.length === 0 ? (
                   <p>No reservations for this guest.</p>
                 ) : (
@@ -1608,6 +1531,10 @@ export default function App() {
             )}
           </section>
         )}
+
+        {activeView === "payments" && <PaymentsScreen session={session} />}
+
+        {activeView === "profile" && <MyProfileScreen session={session} />}
       </div>
     </main>
   );
