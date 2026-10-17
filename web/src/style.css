@@ -817,3 +817,110 @@ select {
     gap: 10px;
   }
 }
+
+/* ---------- Payments, profile and review (additions) ---------- */
+.pay-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 14px;
+  margin: 14px 0;
+}
+
+.pay-grid .kpi-card strong {
+  font-size: 1.35rem;
+  overflow-wrap: anywhere;
+}
+
+.status-pill.pending {
+  background: var(--lime);
+  color: #55631a;
+}
+
+.status-pill.approved {
+  background: var(--mint);
+  color: var(--green);
+}
+
+.status-pill.rejected {
+  background: var(--red-soft);
+  color: var(--red);
+}
+
+.proof-list {
+  display: grid;
+  gap: 10px;
+  padding: 0;
+  margin: 10px 0 18px;
+  list-style: none;
+}
+
+.proof-list li {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 14px 16px;
+  background: var(--mint-soft);
+  border: 1px solid var(--mint);
+  border-radius: 14px;
+}
+
+.proof-review-note {
+  margin-top: 6px;
+  padding: 6px 10px;
+  border-radius: 10px;
+  background: var(--red-soft);
+  color: var(--red);
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.proof-toolbar {
+  grid-template-columns: 1fr 1.4fr auto;
+  align-items: end;
+}
+
+.reject-row td {
+  background: var(--mint-soft);
+  white-space: normal;
+}
+
+textarea {
+  font: inherit;
+  width: 100%;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--ink);
+  resize: vertical;
+}
+
+.detail-list {
+  display: grid;
+  grid-template-columns: minmax(120px, 200px) 1fr;
+  gap: 8px 16px;
+  margin: 0 0 14px;
+}
+
+.detail-list dt {
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.detail-list dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 640px) {
+  .proof-toolbar {
+    grid-template-columns: 1fr;
+  }
+  .proof-list li {
+    flex-direction: column;
+  }
+}
