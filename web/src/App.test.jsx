@@ -361,6 +361,11 @@ describe("authentication screen", () => {
     });
 
     render(<App />);
+    expect(screen.getByLabelText("Username or email")).toBeInTheDocument();
+    expect(screen.queryByLabelText("First name")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Sign up" }));
+    expect(screen.queryByLabelText("Username or email")).not.toBeInTheDocument();
+
     await userEvent.type(screen.getByLabelText("First name"), "Guest");
     await userEvent.type(screen.getByLabelText("Last name"), "User");
     await userEvent.type(screen.getByLabelText("Email"), "guest@example.com");
@@ -369,5 +374,18 @@ describe("authentication screen", () => {
 
     expect(await screen.findByRole("button", { name: "Logout" })).toBeInTheDocument();
     expect(screen.getByText("Guest", { selector: ".role-chip" })).toBeInTheDocument();
+  });
+
+  it("switches from sign up back to sign in only when its button is clicked", async () => {
+    render(<App />);
+    await userEvent.click(screen.getByRole("button", { name: "Sign up" }));
+
+    expect(screen.getByLabelText("First name")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Create guest account" })).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Sign in" }));
+
+    expect(screen.getByLabelText("Username or email")).toBeInTheDocument();
+    expect(screen.queryByLabelText("First name")).not.toBeInTheDocument();
   });
 });

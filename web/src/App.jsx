@@ -102,6 +102,8 @@ function LoginScreen({
   setLoginForm,
   guestForm,
   setGuestForm,
+  authMode,
+  setAuthMode,
   onSignIn,
   onCreateGuest,
 }) {
@@ -122,95 +124,117 @@ function LoginScreen({
         )}
 
         <div className="auth-grid">
-          <section aria-labelledby="sign-in-heading">
-            <h2 id="sign-in-heading">Sign in</h2>
-            <form className="form-grid" onSubmit={onSignIn}>
-              <label>
-                Username or email
-                <input
-                  required
-                  value={loginForm.username}
-                  onChange={(event) =>
-                    setLoginForm({ ...loginForm, username: event.target.value })
-                  }
-                />
-              </label>
-              <label>
-                Password
-                <input
-                  required
-                  type="password"
-                  value={loginForm.password}
-                  onChange={(event) =>
-                    setLoginForm({ ...loginForm, password: event.target.value })
-                  }
-                />
-              </label>
-              <button disabled={busy} type="submit" className="primary-action">
-                Sign in
-              </button>
-            </form>
-          </section>
-
-          <section aria-labelledby="create-guest-heading">
-            <h2 id="create-guest-heading">Create guest account</h2>
-            <form className="form-grid" onSubmit={onCreateGuest}>
-              <label>
-                First name
-                <input
-                  required
-                  value={guestForm.firstName}
-                  onChange={(event) =>
-                    setGuestForm({ ...guestForm, firstName: event.target.value })
-                  }
-                />
-              </label>
-              <label>
-                Last name
-                <input
-                  required
-                  value={guestForm.lastName}
-                  onChange={(event) =>
-                    setGuestForm({ ...guestForm, lastName: event.target.value })
-                  }
-                />
-              </label>
-              <label>
-                Email
-                <input
-                  required
-                  type="email"
-                  value={guestForm.email}
-                  onChange={(event) =>
-                    setGuestForm({ ...guestForm, email: event.target.value })
-                  }
-                />
-              </label>
-              <label>
-                Phone (optional)
-                <input
-                  value={guestForm.phone}
-                  onChange={(event) =>
-                    setGuestForm({ ...guestForm, phone: event.target.value })
-                  }
-                />
-              </label>
-              <label>
-                Guest password
-                <input
-                  required
-                  type="password"
-                  value={guestForm.password}
-                  onChange={(event) =>
-                    setGuestForm({ ...guestForm, password: event.target.value })
-                  }
-                />
-              </label>
-              <button disabled={busy} type="submit" className="primary-action">
-                Create guest account
-              </button>
-            </form>
-          </section>
+          {authMode === "sign-in" ? (
+            <section aria-labelledby="sign-in-heading">
+              <h2 id="sign-in-heading">Sign in</h2>
+              <form className="form-grid" onSubmit={onSignIn}>
+                <label>
+                  Username or email
+                  <input
+                    required
+                    value={loginForm.username}
+                    onChange={(event) =>
+                      setLoginForm({ ...loginForm, username: event.target.value })
+                    }
+                  />
+                </label>
+                <label>
+                  Password
+                  <input
+                    required
+                    type="password"
+                    value={loginForm.password}
+                    onChange={(event) =>
+                      setLoginForm({ ...loginForm, password: event.target.value })
+                    }
+                  />
+                </label>
+                <div className="auth-actions">
+                  <button disabled={busy} type="submit" className="primary-action">
+                    Sign in
+                  </button>
+                  <button
+                    disabled={busy}
+                    type="button"
+                    className="page-btn"
+                    onClick={() => setAuthMode("sign-up")}
+                  >
+                    Sign up
+                  </button>
+                </div>
+              </form>
+            </section>
+          ) : (
+            <section aria-labelledby="create-guest-heading">
+              <h2 id="create-guest-heading">Sign up</h2>
+              <form className="form-grid" onSubmit={onCreateGuest}>
+                <label>
+                  First name
+                  <input
+                    required
+                    value={guestForm.firstName}
+                    onChange={(event) =>
+                      setGuestForm({ ...guestForm, firstName: event.target.value })
+                    }
+                  />
+                </label>
+                <label>
+                  Last name
+                  <input
+                    required
+                    value={guestForm.lastName}
+                    onChange={(event) =>
+                      setGuestForm({ ...guestForm, lastName: event.target.value })
+                    }
+                  />
+                </label>
+                <label>
+                  Email
+                  <input
+                    required
+                    type="email"
+                    value={guestForm.email}
+                    onChange={(event) =>
+                      setGuestForm({ ...guestForm, email: event.target.value })
+                    }
+                  />
+                </label>
+                <label>
+                  Phone (optional)
+                  <input
+                    value={guestForm.phone}
+                    onChange={(event) =>
+                      setGuestForm({ ...guestForm, phone: event.target.value })
+                    }
+                  />
+                </label>
+                <label>
+                  Guest password
+                  <input
+                    required
+                    type="password"
+                    value={guestForm.password}
+                    onChange={(event) =>
+                      setGuestForm({ ...guestForm, password: event.target.value })
+                    }
+                  />
+                </label>
+                <div className="auth-actions">
+                  <button disabled={busy} type="submit" className="primary-action">
+                    Create guest account
+                  </button>
+                  <button
+                    disabled={busy}
+                    type="button"
+                    className="page-btn"
+                    onClick={() => setAuthMode("sign-in")}
+                  >
+                    Sign in
+                  </button>
+                </div>
+              </form>
+            </section>
+          )}
         </div>
       </section>
     </main>
@@ -221,6 +245,7 @@ export default function App() {
   const [session, setSession] = useState(() => getSession());
   const [authError, setAuthError] = useState("");
   const [authBusy, setAuthBusy] = useState(false);
+  const [authMode, setAuthMode] = useState("sign-in");
   const [loginForm, setLoginForm] = useState({ username: "", password: "" });
   const [guestForm, setGuestForm] = useState({
     firstName: "",
@@ -710,6 +735,8 @@ export default function App() {
         setLoginForm={setLoginForm}
         guestForm={guestForm}
         setGuestForm={setGuestForm}
+        authMode={authMode}
+        setAuthMode={setAuthMode}
         onSignIn={handleSignIn}
         onCreateGuest={handleCreateGuest}
       />
