@@ -20,6 +20,30 @@ function nights(checkIn, checkOut) {
   return Number.isFinite(diff) ? Math.round(diff / 86_400_000) : "";
 }
 
+const ICONS = {
+  dashboard: "M4 4h6v6H4z M14 4h6v6h-6z M4 14h6v6H4z M14 14h6v6h-6z",
+  calendar: "M5 5h14v15H5z M5 10h14 M9 3v4 M15 3v4",
+  rooms: "M3 11l9-7 9 7 M5 10v10h14V10 M10 20v-6h4v6",
+  guests: "M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8z M4 20c0-4 4-6 8-6s8 2 8 6",
+  housekeeping: "M12 3v4 M12 17v4 M3 12h4 M17 12h4 M6 6l2.5 2.5 M15.5 15.5L18 18 M18 6l-2.5 2.5 M8.5 15.5L6 18",
+  billing: "M3 6h18v12H3z M3 10h18 M7 15h4",
+  reports: "M5 20V10 M12 20V4 M19 20v-7",
+  settings: "M4 7h9 M17 7h3 M4 17h3 M11 17h9 M13 4v6 M7 14v6",
+  check: "M5 12l4 4 10-10",
+  close: "M6 6l12 12 M18 6L6 18",
+  cash: "M12 3v18 M16 7c0-2-2-3-4-3s-4 1-4 3 2 3 4 3 4 1 4 3-2 3-4 3-4-1-4-3",
+};
+
+function Icon({ name, size = 18, className = "nav-icon" }) {
+  return (
+      <svg className={className} viewBox="0 0 24 24" width={size} height={size}
+           fill="none" stroke="currentColor" strokeWidth="1.8"
+           strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+        <path d={ICONS[name]} />
+      </svg>
+  );
+}
+
 export default function App() {
   const [role, setRole] = useState("agent");
   const [view, setView] = useState("reservations");
@@ -234,7 +258,14 @@ export default function App() {
         reservation.reservationNo.toLowerCase().includes(query) ||
         String(reservation.guestId).toLowerCase().includes(query)),
   );
-
+  const confirmedList = reservations.filter((r) => r.status === "confirmed");
+  const confirmedCount = confirmedList.length;
+  const cancelledCount = reservations.filter((r) => r.status === "cancelled").length;
+  const confirmedRevenue = confirmedList.reduce(
+      (sum, r) => sum + (Number(r.totalAmount) || 0), 0);
+  const revenueCurrency = reservations[0]?.currency || "";
+  const confirmedPct = reservations.length
+      ? Math.round((confirmedCount / reservations.length) * 100) : 0;
   const currentRole = ROLES.find((item) => item.value === role);
   const today = new Date().toLocaleString("en-US", {
     month: "short",
@@ -249,54 +280,38 @@ export default function App() {
       <aside className="sidebar">
         <div className="brand-block">
           <div className="brand-mark">H</div>
+          <span className="brand-name">StayDesk</span>
         </div>
 
+        <div className="nav-caption">Menu</div>
         <nav className="nav" aria-label="Sidebar navigation">
-          <button type="button" className="nav-item">
-            <span className="nav-icon">▣</span>
-            <span>Dashboard</span>
+          <button type="button" className="nav-item" disabled title="Coming soon">
+            <Icon name="dashboard" /><span>Dashboard</span>
           </button>
-          <button
-            type="button"
-            className={`nav-item ${view === "reservations" ? "active" : ""}`}
-            onClick={() => {
-              setView("reservations");
-              setError("");
-            }}
-          >
-            <span className="nav-icon">▤</span>
-            <span>Reservations</span>
+          <button type="button"
+                  className={`nav-item ${view === "reservations" ? "active" : ""}`}
+                  onClick={() => { setView("reservations"); setError(""); }}>
+            <Icon name="calendar" /><span>Reservations</span>
           </button>
-          <button type="button" className="nav-item">
-            <span className="nav-icon">⌂</span>
-            <span>Rooms</span>
+          <button type="button" className="nav-item" disabled title="Coming soon">
+            <Icon name="rooms" /><span>Rooms</span>
           </button>
-          <button
-            type="button"
-            className={`nav-item ${view === "guests" ? "active" : ""}`}
-            onClick={() => {
-              setView("guests");
-              setError("");
-            }}
-          >
-            <span className="nav-icon">◌</span>
-            <span>Guests</span>
+          <button type="button"
+                  className={`nav-item ${view === "guests" ? "active" : ""}`}
+                  onClick={() => { setView("guests"); setError(""); }}>
+            <Icon name="guests" /><span>Guests</span>
           </button>
-          <button type="button" className="nav-item">
-            <span className="nav-icon">↗</span>
-            <span>Housekeeping</span>
+          <button type="button" className="nav-item" disabled title="Coming soon">
+            <Icon name="housekeeping" /><span>Housekeeping</span>
           </button>
-          <button type="button" className="nav-item">
-            <span className="nav-icon">▥</span>
-            <span>Billing</span>
+          <button type="button" className="nav-item" disabled title="Coming soon">
+            <Icon name="billing" /><span>Billing</span>
           </button>
-          <button type="button" className="nav-item">
-            <span className="nav-icon">▨</span>
-            <span>Reports</span>
+          <button type="button" className="nav-item" disabled title="Coming soon">
+            <Icon name="reports" /><span>Reports</span>
           </button>
-          <button type="button" className="nav-item">
-            <span className="nav-icon">◫</span>
-            <span>Settings</span>
+          <button type="button" className="nav-item" disabled title="Coming soon">
+            <Icon name="settings" /><span>Settings</span>
           </button>
         </nav>
 
@@ -322,12 +337,16 @@ export default function App() {
 
       <div className="main-panel">
         <header className="topbar">
-          <div className="page-title">
-            {view === "reservations"
-              ? "Reservations Management"
-              : "Guest Lookup"}
+          <div>
+            <p className="eyebrow">{view === "reservations" ? "Front desk" : "Guest services"}</p>
+            <div className="page-title">
+              {view === "reservations" ? "Reservations Management" : "Guest Lookup"}
+            </div>
           </div>
-          <div className="system-date">System Date: {today}</div>
+          <div className="topbar-right">
+            <div className="system-date">System Date: {today}</div>
+            <div className="role-chip">{currentRole.label}</div>
+          </div>
         </header>
 
         {error && (
@@ -338,6 +357,33 @@ export default function App() {
 
         {view === "reservations" && (
           <>
+            <section className="kpi-grid" aria-label="Booking summary">
+              <article className="kpi-card kpi-primary">
+                <div className="kpi-top"><span>Total bookings</span>
+                  <span className="kpi-icon"><Icon name="calendar" /></span></div>
+                <strong>{reservations.length}</strong>
+                <small>in current view</small>
+              </article>
+              <article className="kpi-card">
+                <div className="kpi-top"><span>Confirmed</span>
+                  <span className="kpi-icon"><Icon name="check" /></span></div>
+                <strong>{confirmedCount}</strong>
+                <div className="kpi-bar" aria-hidden="true"><i style={{ width: `${confirmedPct}%` }} /></div>
+                <small>{confirmedPct}% of bookings</small>
+              </article>
+              <article className="kpi-card">
+                <div className="kpi-top"><span>Cancelled</span>
+                  <span className="kpi-icon"><Icon name="close" /></span></div>
+                <strong>{cancelledCount}</strong>
+                <small>in current view</small>
+              </article>
+              <article className="kpi-card">
+                <div className="kpi-top"><span>Confirmed revenue</span>
+                  <span className="kpi-icon"><Icon name="cash" /></span></div>
+                <strong>{confirmedRevenue.toLocaleString()}</strong>
+                <small>{revenueCurrency || "—"} total</small>
+              </article>
+            </section>
             {bookingOpen && (
               <section
                 aria-labelledby="new-reservation-heading"
@@ -484,7 +530,7 @@ export default function App() {
                 )}
 
                 {confirmation && (
-                  <section aria-labelledby="confirmation-heading" role="status">
+                    <section aria-labelledby="confirmation-heading" role="status" className="confirmation-card">
                     <h3 id="confirmation-heading">Booking confirmed</h3>
                     <p>
                       Reservation number:{" "}
@@ -566,7 +612,10 @@ export default function App() {
 
             <section className="register-panel">
               <div className="register-header">
-                <h2>Active Booking Register</h2>
+                <div>
+                  <h2>Active Booking Register</h2>
+                  <p className="muted">Review, modify or cancel guest stays</p>
+                </div>
                 <button
                   type="button"
                   className="primary-action"
@@ -725,7 +774,7 @@ export default function App() {
                     ))}
                     {visibleReservations.length === 0 && (
                       <tr>
-                        <td colSpan="9">No reservations found.</td>
+                        <td colSpan="9" className="empty-cell">No reservations found.</td>
                       </tr>
                     )}
                   </tbody>
