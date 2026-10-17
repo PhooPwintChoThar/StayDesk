@@ -137,6 +137,21 @@ describe('room-rate endpoints', () => {
     ]);
   });
 
+  it('lists room types from the database', async () => {
+    await pool.query(`
+      INSERT INTO room_types (id, hotel_id, name, max_occupancy)
+      VALUES ('family-room', 'test-hotel', 'Family', 4)
+    `);
+
+    const response = await request(app).get('/room-types');
+
+    expect(response.status).toBe(200);
+    expect(response.body.roomTypes).toEqual([
+      { id: 'family-room', name: 'Family', maxOccupancy: 4 },
+      { id: 'test-room-type', name: 'Test Room', maxOccupancy: 2 }
+    ]);
+  });
+
   it('confirms and releases a hold', async () => {
     const created = await request(app).post('/holds').send({
       roomTypeId: 'test-room-type',

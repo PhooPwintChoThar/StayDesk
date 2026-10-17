@@ -96,6 +96,71 @@ describe('guest endpoints', () => {
     });
   });
 
+  it('lets a guest update profile details without changing their email', async () => {
+    const created = await request(app)
+      .post('/guests/get-or-create')
+      .set('x-user-role', 'manager')
+      .send({
+        email: 'guest@example.com',
+        firstName: 'Test',
+        lastName: 'Guest',
+        loyaltyNumber: 'LEGACY-1'
+      });
+
+    const response = await request(app)
+      .put(`/guests/${created.body.id}`)
+      .set('x-user-id', created.body.id)
+      .set('x-user-role', 'guest')
+      .send({
+        email: 'guest@example.com',
+        firstName: 'Test',
+        lastName: 'Guest',
+        phone: '5551234',
+        idDocument: 'PASSPORT-123',
+        preferences: 'Quiet room'
+      });
+
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({
+      email: 'guest@example.com',
+      phone: '5551234',
+      idDocument: 'PASSPORT-123',
+      preferences: 'Quiet room',
+      loyaltyNumber: 'LEGACY-1'
+    });
+
+    const stored = await request(app)
+      .get(`/guests/${created.body.id}`)
+      .set('x-user-id', created.body.id)
+      .set('x-user-role', 'guest');
+    expect(stored.body.idDocument).toBe('PASSPORT-123');
+  });
+
+  it('does not let a guest change their account email', async () => {
+    const created = await request(app).post('/guests/get-or-create').send({
+      email: 'guest@example.com',
+      firstName: 'Test',
+      lastName: 'Guest'
+    });
+
+    const response = await request(app)
+      .put(`/guests/${created.body.id}`)
+      .set('x-user-id', created.body.id)
+      .set('x-user-role', 'guest')
+      .send({
+        email: 'new@example.com',
+        firstName: 'Test',
+        lastName: 'Guest'
+      });
+
+    expect(response.status).toBe(403);
+    const stored = await request(app)
+      .get(`/guests/${created.body.id}`)
+      .set('x-user-id', created.body.id)
+      .set('x-user-role', 'guest');
+    expect(stored.body.email).toBe('guest@example.com');
+  });
+
   it('stores profile extras, exports them, and deletes the guest', async () => {
     const created = await request(app).post('/guests/get-or-create').send({
       email: 'loyalty@example.com',

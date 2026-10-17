@@ -50,6 +50,14 @@ function mockApi(routes) {
     if (path === "/auth/register") {
       return reply(201, { guestId: "guest-1", email: JSON.parse(options.body).email });
     }
+    if (path === "/room-types") {
+      return reply(200, {
+        roomTypes: [
+          { id: "standard", name: "Standard" },
+          { id: "suite", name: "Suite" },
+        ],
+      });
+    }
     for (const [key, handler] of Object.entries(routes)) {
       const [routeMethod, prefix] = key.split(" ");
       if (routeMethod === method && path.startsWith(prefix))
@@ -269,7 +277,7 @@ describe("role switcher and guests page", () => {
   await screen.findByRole("button", { name: /Guests$/ });
     await userEvent.click(screen.getByRole("button", { name: /Guests$/ }));
     await userEvent.type(
-      screen.getByLabelText("Name, email, phone or loyalty number"),
+      screen.getByLabelText("Name, email or phone"),
       "test",
     );
     await userEvent.click(

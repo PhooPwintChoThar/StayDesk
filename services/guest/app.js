@@ -347,11 +347,17 @@ export function createApp({ db = pool } = {}) {
       if (!current.rowCount) {
         return errorResponse(res, 404, 'NotFound', 'Guest not found.');
       }
+      if (actor.role === 'guest' && guest.email !== current.rows[0].email) {
+        return errorResponse(res, 403, 'Forbidden', 'Guests cannot change their account email.');
+      }
       if (actor.role !== 'manager' && loyaltyTierProvided && guest.loyaltyTier !== current.rows[0].loyaltyTier) {
         return errorResponse(res, 403, 'Forbidden', 'Only managers can change loyalty tier.');
       }
       if (actor.role !== 'manager' && !loyaltyTierProvided) {
         guest.loyaltyTier = current.rows[0].loyaltyTier;
+      }
+      if (!Object.prototype.hasOwnProperty.call(req.body ?? {}, 'loyaltyNumber')) {
+        guest.loyaltyNumber = current.rows[0].loyaltyNumber;
       }
       const result = await db.query(
         `UPDATE guests

@@ -26,7 +26,7 @@ const guestRecord = {
   phone: "+66 81 000 0000",
   address: "1 Sukhumvit Rd",
   preferences: "High floor, quiet room",
-  idDocument: "P*****789",
+  idDocument: "P123456789",
   loyaltyTier: "gold",
   loyaltyNumber: "L-42",
 };
@@ -225,17 +225,21 @@ describe("cancel flow", () => {
   });
 });
 
-describe("loyalty tier", () => {
+describe("room search and guest records", () => {
   const bookingRoutes = () =>
     routes({
       "GET /availability": () =>
         reply(200, {
-          availability: [{ roomTypeId: "standard", available: true, roomsAvailable: 1, nightlyRate: 100, currency: "USD" }],
+          availability: [
+            { roomTypeId: "standard", name: "Standard", available: true, roomsAvailable: 1, nightlyRate: 100, currency: "USD" },
+            { roomTypeId: "sold-out", name: "Sold out", available: false, roomsAvailable: 0, nightlyRate: 150, currency: "USD" },
+          ],
         }),
     });
 
   async function reachGuestForm() {
     await userEvent.click(await screen.findByRole("button", { name: "+ New Reservation" }));
+    await screen.findByLabelText("Room type (optional)");
     await userEvent.type(screen.getByLabelText("Check-in"), "2027-03-10");
     await userEvent.type(screen.getByLabelText("Check-out"), "2027-03-12");
     await userEvent.click(screen.getByRole("button", { name: "Search availability" }));
@@ -243,44 +247,41 @@ describe("loyalty tier", () => {
     await screen.findByLabelText("First name");
   }
 
-  it.each(["guest", "agent", "manager"])("has no loyalty tier input in the booking form for %s", async (role) => {
+  it("selects room types from the database catalog and shows available rooms only", async () => {
+    setRole("agent");
+    mockApi(bookingRoutes());
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "+ New Reservation" }));
+    const typeSelect = await screen.findByLabelText("Room type (optional)");
+    expect(within(typeSelect).getByRole("option", { name: "Standard" })).toBeInTheDocument();
+    expect(within(typeSelect).getByRole("option", { name: "Suite" })).toBeInTheDocument();
+    expect(screen.queryByLabelText("Hotel (optional)")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Room type ID (optional)")).not.toBeInTheDocument();
+    await userEvent.selectOptions(typeSelect, "standard");
+    await userEvent.type(screen.getByLabelText("Check-in"), "2027-03-10");
+    await userEvent.type(screen.getByLabelText("Check-out"), "2027-03-12");
+    await userEvent.click(screen.getByRole("button", { name: "Search availability" }));
+
+    const available = await screen.findByRole("list", { name: "Available rooms" });
+    expect(within(available).getByText(/Standard/)).toBeInTheDocument();
+    expect(within(available).queryByText(/Sold out/)).not.toBeInTheDocument();
+    expect(calls("GET", "/availability?checkIn=2027-03-10&checkOut=2027-03-12&roomTypeId=standard")).toHaveLength(1);
+  });
+
+  it.each(["guest", "agent", "manager"])("shows no loyalty controls or data for %s", async (role) => {
     setRole(role);
     mockApi(bookingRoutes());
     render(<App />);
     await reachGuestForm();
 
-    expect(screen.queryByLabelText("Loyalty tier")).not.toBeInTheDocument();
-    expect(screen.queryByRole("combobox", { name: /loyalty tier/i })).not.toBeInTheDocument();
-  });
-
-  it("does not send loyaltyTier when booking", async () => {
-    setRole("agent");
-    mockApi({
-      ...bookingRoutes(),
-      "POST /reservations": () => reply(201, { ...stored, reservationNo: "R-1", depositAmount: 30 }),
-    });
-    render(<App />);
-    await reachGuestForm();
-    await userEvent.type(screen.getByLabelText("Email"), "g@example.com");
-    await userEvent.type(screen.getByLabelText("First name"), "T");
-    await userEvent.type(screen.getByLabelText("Last name"), "G");
-    await userEvent.click(screen.getByRole("button", { name: "Book room" }));
-
-    await screen.findByRole("status");
-    expect(JSON.parse(calls("POST", "/reservations")[0][1].body).guest).not.toHaveProperty("loyaltyTier");
-  });
-
-  it("has no loyalty tier input on the sign-up form", () => {
-    setRole(null);
-    mockApi({});
-    render(<App />);
-
-    expect(screen.queryByLabelText("Loyalty tier")).not.toBeInTheDocument();
+    expect(screen.queryByText(/loyalty/i)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/loyalty/i)).not.toBeInTheDocument();
   });
 
   async function openGuestProfile() {
     await userEvent.click(await screen.findByRole("button", { name: /Guests$/ }));
-    await userEvent.type(screen.getByLabelText("Name, email, phone or loyalty number"), "test");
+    await userEvent.type(screen.getByLabelText("Name, email or phone"), "test");
     await userEvent.click(screen.getByRole("button", { name: "Search guests" }));
     await userEvent.click(await screen.findByRole("button", { name: "View stays" }));
     await screen.findByText(/Stay history:/);
@@ -292,61 +293,67 @@ describe("loyalty tier", () => {
       ...extra,
     });
 
-  it("shows the tier read-only to an agent and hides Delete profile", async () => {
-    setRole("agent");
+  it.each(["agent", "manager"])("shows guest records without loyalty data to a %s", async (role) => {
+    setRole(role);
     mockApi(guestRoutes());
     render(<App />);
     await openGuestProfile();
 
-    expect(screen.getByText(/Loyalty tier: gold/)).toBeInTheDocument();
-    expect(screen.queryByLabelText("Loyalty tier")).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Save tier" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Delete profile" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/loyalty/i)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/loyalty/i)).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Export profile" })).toBeInTheDocument();
+    if (role === "manager") {
+      expect(screen.getByRole("button", { name: "Delete profile" })).toBeInTheDocument();
+    } else {
+      expect(screen.queryByRole("button", { name: "Delete profile" })).not.toBeInTheDocument();
+    }
   });
 
-  it("lets a manager edit the tier and delete the profile", async () => {
-    setRole("manager");
-    mockApi(
-      guestRoutes({
-        "PUT /guests/guest-1": (_path, options) => reply(200, { ...guestRecord, ...JSON.parse(options.body) }),
-      }),
-    );
+  it("does not show loyalty fields on the sign-up form", () => {
+    setRole(null);
+    mockApi({});
     render(<App />);
-    await openGuestProfile();
-
-    expect(screen.getByRole("button", { name: "Delete profile" })).toBeInTheDocument();
-    const save = screen.getByRole("button", { name: "Save tier" });
-    expect(save).toBeDisabled(); // unchanged
-
-    await userEvent.selectOptions(screen.getByLabelText("Loyalty tier"), "platinum");
-    await userEvent.click(save);
-
-    await waitFor(() => expect(calls("PUT", "/guests/guest-1")).toHaveLength(1));
-    const body = JSON.parse(calls("PUT", "/guests/guest-1")[0][1].body);
-    expect(body).toMatchObject({ loyaltyTier: "platinum", email: "guest@example.com", firstName: "Test" });
-    expect(await screen.findByText(/Loyalty tier: platinum/)).toBeInTheDocument();
+    expect(screen.queryByText(/loyalty/i)).not.toBeInTheDocument();
   });
+
 });
 
 describe("guest My profile", () => {
-  it("shows contact details, preferences, ID document and a read-only tier", async () => {
+  it("lets the guest edit profile details but keeps email read-only", async () => {
     setRole("guest");
-    mockApi(routes({ "GET /guests/guest-1": () => reply(200, guestRecord) }));
+    let updated = guestRecord;
+    mockApi(
+      routes({
+        "GET /guests/guest-1": () => reply(200, updated),
+        "PUT /guests/guest-1": (_path, options) => {
+          updated = { ...updated, ...JSON.parse(options.body) };
+          return reply(200, updated);
+        },
+      }),
+    );
     render(<App />);
 
     await userEvent.click(await screen.findByRole("button", { name: "My profile" }));
 
-    const contact = await screen.findByLabelText("Contact details");
-    expect(contact).toHaveTextContent("Test Guest");
-    expect(contact).toHaveTextContent("guest@example.com");
-    expect(contact).toHaveTextContent("+66 81 000 0000");
-    expect(contact).toHaveTextContent("1 Sukhumvit Rd");
-    expect(screen.getByLabelText("Preferences and documents")).toHaveTextContent("High floor, quiet room");
-    expect(screen.getByLabelText("Preferences and documents")).toHaveTextContent("P*****789"); // as returned
-    expect(screen.getByLabelText("Loyalty")).toHaveTextContent("gold");
-    expect(screen.queryByLabelText("Loyalty tier")).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Save changes" })).not.toBeInTheDocument();
+    const email = await screen.findByLabelText("Email");
+    expect(email).toHaveValue("guest@example.com");
+    expect(email).toHaveAttribute("readonly");
+    const documentNumber = screen.getByLabelText("Passport or ID number");
+    await userEvent.clear(documentNumber);
+    await userEvent.type(documentNumber, "PASSPORT-UPDATED");
+    await userEvent.clear(screen.getByLabelText("Phone"));
+    await userEvent.type(screen.getByLabelText("Phone"), "+66 81 999 0000");
+    await userEvent.click(screen.getByRole("button", { name: "Save profile" }));
+
+    expect(await screen.findByRole("status")).toHaveTextContent("Profile updated.");
+    expect(calls("PUT", "/guests/guest-1")).toHaveLength(1);
+    expect(JSON.parse(calls("PUT", "/guests/guest-1")[0][1].body)).toMatchObject({
+      email: "guest@example.com",
+      phone: "+66 81 999 0000",
+      idDocument: "PASSPORT-UPDATED",
+    });
+    expect(updated.idDocument).toBe("PASSPORT-UPDATED");
+    expect(screen.queryByText(/loyalty/i)).not.toBeInTheDocument();
   });
 
   it("shows an error state when the profile cannot be loaded", async () => {

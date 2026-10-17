@@ -36,6 +36,14 @@ export function mockApi(routes) {
       if (!role) return reply(401, { error: "Unauthorized" });
       return reply(200, { token: makeToken(claimsFor(role)) });
     }
+    if (path === "/room-types") {
+      return reply(200, {
+        roomTypes: [
+          { id: "standard", name: "Standard" },
+          { id: "suite", name: "Suite" },
+        ],
+      });
+    }
     let best = null;
     for (const [key, handler] of Object.entries(routes)) {
       const [routeMethod, prefix] = key.split(" ");

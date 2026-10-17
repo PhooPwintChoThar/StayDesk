@@ -19,7 +19,6 @@ const initialSearch = {
   checkIn: "",
   checkOut: "",
   roomTypeId: "",
-  hotelId: "",
   guests: "1",
 };
 const initialGuest = {
@@ -30,7 +29,6 @@ const initialGuest = {
   address: "",
   idDocument: "",
   preferences: "",
-  loyaltyNumber: "",
   consent: false,
   channel: "email",
 };
@@ -272,11 +270,9 @@ export default function App() {
   const [guests, setGuests] = useState([]);
   const [selectedGuest, setSelectedGuest] = useState(null);
   const [guestReservations, setGuestReservations] = useState([]);
-  const [hotels, setHotels] = useState([]);
+  const [roomTypeOptions, setRoomTypeOptions] = useState([]);
   const [lookupNo, setLookupNo] = useState("");
   const [lookedUp, setLookedUp] = useState(null);
-  const [tierDraft, setTierDraft] = useState("none");
-  const [tierBusy, setTierBusy] = useState(false);
 
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -424,9 +420,12 @@ export default function App() {
     });
     setConfirmation(null);
     setError("");
-    apiRequest("/hotels")
-      .then((result) => setHotels(result.hotels || []))
-      .catch(() => setHotels([]));
+    apiRequest("/room-types")
+      .then((result) => setRoomTypeOptions(result.roomTypes || []))
+      .catch((err) => {
+        setRoomTypeOptions([]);
+        setError(err.message);
+      });
   }
 
   async function searchRooms(event) {
@@ -443,11 +442,10 @@ export default function App() {
         checkOut: search.checkOut,
       });
       if (search.roomTypeId) params.set("roomTypeId", search.roomTypeId);
-      if (search.hotelId) params.set("hotelId", search.hotelId);
       if (search.guests) params.set("guests", search.guests);
 
       const result = await apiRequest(`/availability?${params}`);
-      setAvailability(result.availability || []);
+      setAvailability((result.availability || []).filter((room) => room.available));
     } catch (err) {
       setError(err.message);
     } finally {
@@ -473,7 +471,6 @@ export default function App() {
             address: guest.address,
             idDocument: guest.idDocument,
             preferences: guest.preferences,
-            loyaltyNumber: guest.loyaltyNumber,
             consent: guest.consent,
           },
           roomTypeId: selectedRoom.roomTypeId,
@@ -612,7 +609,6 @@ export default function App() {
   async function showGuest(selected) {
     setError("");
     setSelectedGuest(selected);
-    setTierDraft(selected.loyaltyTier || "none");
     try {
       const result = await apiRequest(
         `/reservations?guestId=${encodeURIComponent(selected.id)}`,
@@ -658,46 +654,6 @@ export default function App() {
       }
     } catch (err) {
       setError(err.message);
-    }
-  }
-
-  // Manager-only. The UI hides this for everyone else; the gateway enforces it.
-  async function saveGuestTier(event) {
-    event.preventDefault();
-    if (!selectedGuest || role !== "manager") return;
-
-    setError("");
-    setTierBusy(true);
-    try {
-      const body = { loyaltyTier: tierDraft };
-      for (const field of [
-        "email",
-        "firstName",
-        "lastName",
-        "phone",
-        "address",
-        "idDocument",
-        "preferences",
-        "loyaltyNumber",
-      ]) {
-        if (selectedGuest[field] != null) body[field] = selectedGuest[field];
-      }
-      const updated = await apiRequest(
-        `/guests/${encodeURIComponent(selectedGuest.id)}`,
-        { method: "PUT", body: JSON.stringify(body) },
-      );
-      const tier = updated?.loyaltyTier ?? tierDraft;
-      setSelectedGuest((current) => (current ? { ...current, loyaltyTier: tier } : current));
-      setGuests((current) =>
-        current.map((item) =>
-          item.id === selectedGuest.id ? { ...item, loyaltyTier: tier } : item,
-        ),
-      );
-      setTierDraft(tier);
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setTierBusy(false);
     }
   }
 
@@ -957,22 +913,6 @@ export default function App() {
                     />
                   </label>
                   <label>
-                    Hotel (optional)
-                    <select
-                      value={search.hotelId}
-                      onChange={(event) =>
-                        setSearch({ ...search, hotelId: event.target.value })
-                      }
-                    >
-                      <option value="">All hotels</option>
-                      {hotels.map((hotel) => (
-                        <option key={hotel.id} value={hotel.id}>
-                          {hotel.name}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label>
                     Guests
                     <input
                       type="number"
@@ -985,13 +925,20 @@ export default function App() {
                     />
                   </label>
                   <label>
-                    Room type ID (optional)
-                    <input
+                    Room type (optional)
+                    <select
                       value={search.roomTypeId}
                       onChange={(event) =>
                         setSearch({ ...search, roomTypeId: event.target.value })
                       }
-                    />
+                    >
+                      <option value="">All room types</option>
+                      {roomTypeOptions.map((roomType) => (
+                        <option key={roomType.id} value={roomType.id}>
+                          {roomType.name}
+                        </option>
+                      ))}
+                    </select>
                   </label>
                   <button
                     disabled={busy}
@@ -1092,7 +1039,7 @@ export default function App() {
                         />
                       </label>
                       <label>
-                        ID document (optional)
+                        Passport or ID number (optional)
                         <input
                           value={guest.idDocument}
                           onChange={(event) =>
@@ -1111,18 +1058,6 @@ export default function App() {
                             setGuest({
                               ...guest,
                               preferences: event.target.value,
-                            })
-                          }
-                        />
-                      </label>
-                      <label>
-                        Loyalty number (optional)
-                        <input
-                          value={guest.loyaltyNumber}
-                          onChange={(event) =>
-                            setGuest({
-                              ...guest,
-                              loyaltyNumber: event.target.value,
                             })
                           }
                         />
@@ -1438,7 +1373,7 @@ export default function App() {
             </div>
             <form onSubmit={searchGuests} className="form-grid">
               <label>
-                Name, email, phone or loyalty number
+                Name, email or phone
                 <input
                   required
                   value={guestQuery}
@@ -1493,13 +1428,9 @@ export default function App() {
                   Stay history: {selectedGuest.firstName}{" "}
                   {selectedGuest.lastName}
                 </h3>
-                <p className="muted">
-                  Loyalty tier: {selectedGuest.loyaltyTier || "none"}
-                  {selectedGuest.loyaltyNumber
-                    ? ` · ${selectedGuest.loyaltyNumber}`
-                    : ""}
-                  {selectedGuest.address ? ` · ${selectedGuest.address}` : ""}
-                </p>
+                {selectedGuest.address && (
+                  <p className="muted">{selectedGuest.address}</p>
+                )}
                 <div className="lookup-actions">
                   <button
                     type="button"
@@ -1518,33 +1449,6 @@ export default function App() {
                     </button>
                   )}
                 </div>
-                {role === "manager" && (
-                  <form onSubmit={saveGuestTier} className="form-grid">
-                    <label>
-                      Loyalty tier
-                      <select
-                        value={tierDraft}
-                        onChange={(event) => setTierDraft(event.target.value)}
-                      >
-                        <option value="none">None</option>
-                        <option value="member">Member</option>
-                        <option value="silver">Silver</option>
-                        <option value="gold">Gold</option>
-                        <option value="platinum">Platinum</option>
-                      </select>
-                    </label>
-                    <button
-                      type="submit"
-                      className="primary-action"
-                      disabled={
-                        tierBusy ||
-                        tierDraft === (selectedGuest.loyaltyTier || "none")
-                      }
-                    >
-                      Save tier
-                    </button>
-                  </form>
-                )}
                 {guestReservations.length === 0 ? (
                   <p>No reservations for this guest.</p>
                 ) : (

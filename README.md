@@ -96,7 +96,7 @@ Environment variables you may want to set:
 
 ## Role permissions
 
-`GET /availability`, `GET /hotels`, guest registration, and login are public.
+`GET /availability`, `GET /hotels`, `GET /room-types`, guest registration, and login are public.
 The gateway applies the following permissions to authenticated routes:
 
 | Route group | Guest | Agent | Manager |
@@ -106,14 +106,19 @@ The gateway applies the following permissions to authenticated routes:
 | Reservation payment summary and cancellation quote | Own reservation only | All reservations | All reservations |
 | `POST/GET /payments/proofs`, `GET /payments/proofs/{id}/file` | Upload and view own proofs/files | View all proofs/files | View all proofs/files |
 | `PUT /payments/proofs/{id}/review` | Forbidden | Approve or reject | Approve or reject |
-| `POST /guests/get-or-create` | Create or retrieve a profile; loyalty tier is forced to `none` | Create or retrieve; loyalty tier is forced to `none` | Create or retrieve and set loyalty tier |
-| Guest profile read/update and `GET /guests/search` | Own profile only; cannot change loyalty tier | Guest records; cannot change loyalty tier | Guest records and loyalty tier management |
+| `POST /guests/get-or-create` | Create or retrieve a profile | Create or retrieve | Create or retrieve |
+| Guest profile read/update and `GET /guests/search` | Own profile only; email is immutable | Guest records | Guest records |
 | `GET /guests/{id}/export` | Forbidden | Export guest records | Export guest records |
 | `DELETE /guests/{id}` | Forbidden | Forbidden | Delete guest records |
 | Cancel with `waiveFee=true` | Forbidden | Forbidden | Allowed |
 
 Ownership is checked against the authenticated guest ID. User-supplied guest
 filters cannot expand a guest's reservation list.
+
+Guests can update their name, phone, address, passport or ID number, and
+preferences from My profile. The account email is read-only. Reservation
+searches offer database-backed room types; availability is filtered by stay
+dates, guest count, and an optional room type.
 
 ## Payments
 

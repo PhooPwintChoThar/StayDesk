@@ -103,6 +103,19 @@ export function createApp({ db = pool, clock = () => new Date() } = {}) {
     }
   });
 
+  app.get('/room-types', async (_req, res, next) => {
+    try {
+      const result = await db.query(
+        `SELECT id, name, max_occupancy AS "maxOccupancy"
+         FROM room_types
+         ORDER BY name, id`
+      );
+      return res.status(200).json({ roomTypes: result.rows });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
   app.get('/availability', async (req, res, next) => {
     const { checkIn, checkOut, roomTypeId, hotelId, excludeHoldId } = req.query;
     const guests = req.query.guests === undefined || req.query.guests === ''

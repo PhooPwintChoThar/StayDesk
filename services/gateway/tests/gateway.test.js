@@ -73,6 +73,19 @@ describe('gateway authentication and proxying', () => {
     expect(response.status).toBe(200);
   });
 
+  it('allows room type selection data without a token', async () => {
+    const app = createApp({ secret });
+    const upstream = nock(roomRateUrl)
+      .get('/room-types')
+      .reply(200, { roomTypes: [{ id: 'standard', name: 'Standard' }] });
+
+    const response = await request(app).get('/room-types');
+
+    expect(response.status).toBe(200);
+    expect(response.body.roomTypes).toEqual([{ id: 'standard', name: 'Standard' }]);
+    expect(upstream.isDone()).toBe(true);
+  });
+
   it('returns 401 when the JWT is missing or invalid', async () => {
     const app = createApp({ secret });
 

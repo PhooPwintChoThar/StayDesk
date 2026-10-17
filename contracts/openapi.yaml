@@ -103,6 +103,32 @@ paths:
                         name:
                           type: string
 
+  /room-types:
+    get:
+      operationId: listRoomTypes
+      tags: [room-rate]
+      responses:
+        "200":
+          description: Room types available for reservation searches
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [roomTypes]
+                properties:
+                  roomTypes:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, name, maxOccupancy]
+                      properties:
+                        id:
+                          type: string
+                        name:
+                          type: string
+                        maxOccupancy:
+                          type: integer
+
   /availability:
     get:
       operationId: getAvailability

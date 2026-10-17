@@ -7,6 +7,7 @@ export function serviceForPath(path) {
   if (
     path === "/availability" ||
     path === "/hotels" ||
+    path === "/room-types" ||
     path === "/holds" ||
     path.startsWith("/holds/")
   ) {
@@ -31,7 +32,7 @@ export function serviceForPath(path) {
 export function isPublicRoute(method, path) {
   return (
     method === "GET" &&
-    (path === "/availability" || path === "/hotels")
+    (path === "/availability" || path === "/hotels" || path === "/room-types")
   ) || (method === "POST" && path === "/auth/register");
 }
 
@@ -39,6 +40,7 @@ export function allowedForGuest(method, path) {
   return (
     (method === "GET" && path === "/availability") ||
     (method === "GET" && path === "/hotels") ||
+    (method === "GET" && path === "/room-types") ||
     (method === "GET" && path === "/reservations") ||
     (method === "POST" && path === "/reservations") ||
     (["GET", "PUT", "DELETE"].includes(method) &&
