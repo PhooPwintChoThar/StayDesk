@@ -77,6 +77,7 @@ The legacy role-based `POST /login {"role":"agent"}` path is only available when
 
 | Username | Password | Role |
 |---|---|---|
+| reception | reception123 | agent |
 | agent | agent123 | agent |
 | manager | manager123 | manager |
 
@@ -101,7 +102,7 @@ The gateway applies the following permissions to authenticated routes:
 | Route group | Guest | Agent | Manager |
 |---|---|---|---|
 | `GET /reservations` | Own reservations only; the gateway forces the guest filter | List/filter reservations | List/filter reservations |
-| `POST /reservations`, `GET/PUT/DELETE /reservations/{no}` | Create and manage own reservations only | All reservations | All reservations |
+| `POST /reservations`, `GET/PUT/DELETE /reservations/{no}` | Create and manage own reservations only; booking email must match the signed-in account | All reservations | All reservations |
 | Reservation payment summary and cancellation quote | Own reservation only | All reservations | All reservations |
 | `POST/GET /payments/proofs`, `GET /payments/proofs/{id}/file` | Upload and view own proofs/files | View all proofs/files | View all proofs/files |
 | `PUT /payments/proofs/{id}/review` | Forbidden | Approve or reject | Approve or reject |
@@ -160,7 +161,7 @@ Use fresh dates each time, because a confirmed booking uses up a room.
 
 1. **Guest registration and booking.** Register a guest with an email and password, sign in, and book. Expect "Booking confirmed" and a notification line in `docker compose logs notification`.
 2. **Guest payment proof.** As the guest, upload a PNG, JPEG, or PDF proof (up to 5 MB) for an owned reservation. Confirm it appears as `pending`.
-3. **Agent approval.** Sign in as `agent` / `agent123`, approve the proof, and verify the reservation payment summary reports the approved amount and a reduced `balanceDue`.
+3. **Agent approval.** Sign in as `reception` / `reception123` (or `agent` / `agent123`), approve the proof, and verify the reservation payment summary reports the approved amount and a reduced `balanceDue`.
 4. **Agent rejection.** Reject a pending proof with a note and confirm the proof is `rejected` with the note recorded.
 5. **Manager cancellation waiver.** Sign in as `manager` / `manager123` and cancel a reservation with `waiveFee=true`; confirm the fee is waived.
 6. **Guest data isolation.** Sign in as a guest and try to list or view another guest's reservations, payment summary, cancellation quote, proof, or guest profile. The gateway must deny access or return only the signed-in guest's data.

@@ -36,6 +36,9 @@ function mockApi(routes) {
       if (body.role) {
         return reply(200, { token: makeToken({ role: body.role, sub: body.role }) });
       }
+      if (body.username === "reception" && body.password === "reception123") {
+        return reply(200, { token: makeToken({ sub: "reception", role: "agent" }) });
+      }
       if (body.username === "agent" && body.password === "agent123") {
         return reply(200, { token: makeToken({ sub: "agent", role: "agent" }) });
       }
@@ -62,17 +65,6 @@ const calls = (method, prefix) =>
       (options.method || "GET") === method &&
       url.replace(/^https?:\/\/[^/]+/, "").startsWith(prefix),
   );
-
-function roleFromAuthHeader(header) {
-  const token = header?.replace(/^Bearer\s+/, "");
-  const payload = token?.split(".")[1];
-  if (!payload) return null;
-  try {
-    return JSON.parse(atob(payload.replace(/-/g, "+").replace(/_/g, "/"))).role;
-  } catch {
-    return null;
-  }
-}
 
 beforeEach(() => {
   setRole("agent");
@@ -232,12 +224,9 @@ describe("reservations management", () => {
 });
 
 describe("role switcher and guests page", () => {
-  it("logs in with the selected role and shows the guest restriction", async () => {
+  it("logs in with the selected role and lets guests view their bookings", async () => {
     mockApi({
-      "GET /reservations": (_path, options) =>
-        roleFromAuthHeader(options.headers.Authorization) === "guest"
-          ? reply(403, { error: "Forbidden" })
-          : reply(200, { reservations: [stored] }),
+      "GET /reservations": () => reply(200, { reservations: [stored] }),
     });
 
     render(<App />);
@@ -247,10 +236,10 @@ describe("role switcher and guests page", () => {
       "guest",
     );
 
-    expect(await screen.findByLabelText("Confirmation number")).toBeInTheDocument();
-    await waitFor(() =>
-      expect(screen.queryByText("R-STORED")).not.toBeInTheDocument(),
-    );
+    expect(await screen.findByText("My bookings")).toBeInTheDocument();
+    expect(await screen.findByText("R-STORED")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Confirmation number")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     const logins = calls("POST", "/login").map(
       ([, options]) => JSON.parse(options.body).role,
     );
@@ -313,6 +302,20 @@ describe("authentication screen", () => {
 
     expect(await screen.findByRole("button", { name: "Logout" })).toBeInTheDocument();
     expect(screen.getByText("agent")).toBeInTheDocument();
+  });
+
+  it("lets reception sign in with the demo credentials", async () => {
+    mockApi({
+      "GET /reservations": () => reply(200, { reservations: [] }),
+    });
+
+    render(<App />);
+    await userEvent.type(screen.getByLabelText("Username or email"), "reception");
+    await userEvent.type(screen.getByLabelText("Password"), "reception123");
+    await userEvent.click(screen.getByRole("button", { name: "Sign in" }));
+
+    expect(await screen.findByRole("button", { name: "Logout" })).toBeInTheDocument();
+    expect(screen.getByText("reception")).toBeInTheDocument();
   });
 
   it("shows an error when login fails", async () => {

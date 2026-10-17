@@ -98,6 +98,7 @@ describe("guest payments", () => {
               proof({ id: "p1", status: "approved", fileName: "ok.pdf" }),
               proof({ id: "p2", status: "rejected", fileName: "bad.png", reviewNote: "Image is blurry" }),
               proof({ id: "p3", status: "pending", fileName: "wait.png" }),
+              proof({ id: "p4", guestId: "guest-2", fileName: "other-guest.pdf" }),
             ],
           }),
       }),
@@ -112,6 +113,7 @@ describe("guest payments", () => {
     expect(items[1]).toHaveTextContent("Reviewer note: Image is blurry");
     expect(items[2]).toHaveTextContent("pending");
     expect(items[0]).not.toHaveTextContent("Reviewer note");
+    expect(within(list).queryByText("other-guest.pdf")).not.toBeInTheDocument();
   });
 
   it("shows an empty state when the guest has no reservations", async () => {

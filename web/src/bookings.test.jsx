@@ -65,13 +65,64 @@ describe("guest bookings", () => {
     expect(screen.getByText("Showing 1 of 1 entries")).toBeInTheDocument();
     expect(screen.getByText("My bookings")).toBeInTheDocument();
     expect(screen.queryByText(/cannot view the booking register/i)).not.toBeInTheDocument();
-    expect(screen.getByLabelText("Confirmation number")).toBeInTheDocument(); // lookup kept
+    expect(screen.queryByLabelText("Confirmation number")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Search")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("From date")).not.toBeInTheDocument();
+    expect(within(table).getByText("2027-03-10")).toBeInTheDocument();
+    expect(within(table).getByText("2027-03-13")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "+ New Reservation" })).toBeInTheDocument();
     expect(screen.queryByText("Total bookings")).not.toBeInTheDocument(); // staff KPIs stay hidden
+    const listRequest = calls("GET", "/reservations")[0][0];
+    expect(new URL(listRequest, "http://localhost").search).toBe("");
 
     await userEvent.click(screen.getByRole("button", { name: "Actions for R-STORED" }));
     expect(screen.getByRole("menuitem", { name: "Modify" })).toBeEnabled();
     expect(screen.getByRole("menuitem", { name: "Cancel" })).toBeEnabled();
+  });
+
+  it("books under the signed-in guest and refreshes the complete booking list", async () => {
+    setRole("guest");
+    let reservations = [stored];
+    mockApi({
+      "GET /reservations": () => reply(200, { reservations }),
+      "GET /availability": () =>
+        reply(200, {
+          availability: [{ roomTypeId: "standard", available: true, roomsAvailable: 1, nightlyRate: 100, currency: "USD" }],
+        }),
+      "POST /reservations": (_path, options) => {
+        const body = JSON.parse(options.body);
+        const created = {
+          ...stored,
+          reservationNo: "R-GUEST-NEW",
+          guestId: GUEST_ID,
+          checkIn: body.checkIn,
+          checkOut: body.checkOut,
+        };
+        reservations = [...reservations, created];
+        return reply(201, created);
+      },
+    });
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "+ New Reservation" }));
+    await userEvent.type(screen.getByLabelText("Check-in"), "2027-04-01");
+    await userEvent.type(screen.getByLabelText("Check-out"), "2027-04-03");
+    await userEvent.click(screen.getByRole("button", { name: "Search availability" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Select" }));
+
+    const email = screen.getByLabelText("Email");
+    expect(email).toHaveValue("guest@example.com");
+    expect(email).toHaveAttribute("readonly");
+    await userEvent.type(screen.getByLabelText("First name"), "Test");
+    await userEvent.type(screen.getByLabelText("Last name"), "Guest");
+    await userEvent.click(screen.getByRole("button", { name: "Book room" }));
+
+    const table = screen.getByRole("table");
+    expect(await within(table).findByText("R-GUEST-NEW")).toBeInTheDocument();
+    expect(within(table).getByText("2027-04-01")).toBeInTheDocument();
+    expect(within(table).getByText("2027-04-03")).toBeInTheDocument();
+    expect(calls("GET", "/reservations")).toHaveLength(2);
+    expect(JSON.parse(calls("POST", "/reservations")[0][1].body).guest.email).toBe("guest@example.com");
   });
 
   it("lets a guest cancel and sends no waiver", async () => {

@@ -30,6 +30,7 @@ export function mockApi(routes) {
       const body = JSON.parse(options.body);
       const role =
         body.role ||
+        (body.username === "reception" && body.password === "reception123" ? "agent" : null) ||
         (body.username === "agent" && body.password === "agent123" ? "agent" : null) ||
         (body.username === "guest@example.com" && body.password === "secret123" ? "guest" : null);
       if (!role) return reply(401, { error: "Unauthorized" });

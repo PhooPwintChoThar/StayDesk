@@ -149,7 +149,11 @@ function GuestPayments({ session }) {
         if (seq !== detailSeq.current || !mounted.current) return null;
         const normalized = normalizeSummary(summaryResult);
         setSummary(normalized);
-        setProofs(proofResult.proofs || []);
+        setProofs(
+          (proofResult.proofs || []).filter(
+            (proof) => Boolean(guestId) && proof.guestId === guestId,
+          ),
+        );
         setDetailState("ready");
         return normalized;
       } catch (err) {
@@ -159,7 +163,7 @@ function GuestPayments({ session }) {
         return null;
       }
     },
-    [mounted],
+    [guestId, mounted],
   );
 
   function resetForm() {

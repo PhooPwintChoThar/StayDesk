@@ -379,11 +379,10 @@ export default function App() {
 
   const loadReservations = useCallback(async () => {
     const params = new URLSearchParams();
-    if (filters.status) params.set("status", filters.status);
-    if (filters.from) params.set("from", filters.from);
-    if (filters.to) params.set("to", filters.to);
-    if (sessionRef.current?.claims?.role === "guest") {
-      params.set("guestId", sessionRef.current.claims.guestId);
+    if (sessionRef.current?.claims?.role !== "guest") {
+      if (filters.status) params.set("status", filters.status);
+      if (filters.from) params.set("from", filters.from);
+      if (filters.to) params.set("to", filters.to);
     }
 
     try {
@@ -419,7 +418,10 @@ export default function App() {
     setSearch(initialSearch);
     setAvailability([]);
     setSelectedRoom(null);
-    setGuest(initialGuest);
+    setGuest({
+      ...initialGuest,
+      email: role === "guest" ? session?.claims?.sub || "" : "",
+    });
     setConfirmation(null);
     setError("");
     apiRequest("/hotels")
@@ -703,13 +705,16 @@ export default function App() {
     ...new Set(reservations.map((reservation) => reservation.roomTypeId)),
   ];
   const query = filters.q.trim().toLowerCase();
-  const visibleReservations = reservations.filter(
-    (reservation) =>
-      (!filters.roomTypeId || reservation.roomTypeId === filters.roomTypeId) &&
-      (!query ||
-        reservation.reservationNo.toLowerCase().includes(query) ||
-        String(reservation.guestId).toLowerCase().includes(query)),
-  );
+  const visibleReservations =
+    role === "guest"
+      ? reservations
+      : reservations.filter(
+          (reservation) =>
+            (!filters.roomTypeId || reservation.roomTypeId === filters.roomTypeId) &&
+            (!query ||
+              reservation.reservationNo.toLowerCase().includes(query) ||
+              String(reservation.guestId).toLowerCase().includes(query)),
+        );
   const confirmedList = reservations.filter((r) => r.status === "confirmed");
   const confirmedCount = confirmedList.length;
   const cancelledCount = reservations.filter((r) => r.status === "cancelled").length;
@@ -823,6 +828,7 @@ export default function App() {
 
         {activeView === "reservations" && (
           <>
+            {role !== "guest" && (
             <section className="register-panel" aria-labelledby="lookup-heading">
               <div className="register-header">
                 <div>
@@ -879,6 +885,7 @@ export default function App() {
                 </div>
               )}
             </section>
+            )}
 
             {role !== "guest" && (
             <section className="kpi-grid" aria-label="Booking summary">
@@ -1036,6 +1043,7 @@ export default function App() {
                         <input
                           type="email"
                           required
+                          readOnly={role === "guest"}
                           value={guest.email}
                           onChange={(event) =>
                             setGuest({ ...guest, email: event.target.value })
@@ -1255,7 +1263,8 @@ export default function App() {
                 </button>
               </div>
 
-              <div className="toolbar" aria-label="Reservation filters">
+              {role !== "guest" && (
+                <div className="toolbar" aria-label="Reservation filters">
                 <div className="field">
                   <label htmlFor="filter-from">Date Range</label>
                   <div className="date-range">
@@ -1321,7 +1330,8 @@ export default function App() {
                     }
                   />
                 </div>
-              </div>
+                </div>
+              )}
 
               <div className="table-wrap">
                 <table role="table">

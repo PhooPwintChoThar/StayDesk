@@ -150,6 +150,19 @@ export class RouteHandler extends Handler {
     const isProofUpload = req.method === "POST" && req.path === "/payments/proofs" && req.headers["content-type"]?.includes("multipart/form-data");
     const target = new URL(req.originalUrl, "http://gateway.local");
 
+    if (ctx.role === "guest" && req.method === "POST" && req.path === "/reservations") {
+      const requestedEmail = req.body?.guest?.email;
+      const authenticatedEmail = ctx.claims?.sub;
+      if (
+        typeof requestedEmail !== "string" ||
+        typeof authenticatedEmail !== "string" ||
+        !ctx.claims?.guestId ||
+        requestedEmail.trim().toLowerCase() !== authenticatedEmail.trim().toLowerCase()
+      ) {
+        return res.status(403).json({ error: "Forbidden" });
+      }
+    }
+
     if (ctx.role === "guest" && isOwnershipRoute(req.path)) {
       if (!ctx.claims?.guestId) {
         return res.status(403).json({ error: "Forbidden" });

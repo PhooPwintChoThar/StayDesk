@@ -13,6 +13,7 @@ const loginAttempts = new Map();
 
 const demoUsers = [
   { username: 'agent', role: 'agent', passwordHash: bcrypt.hashSync('agent123', 10) },
+  { username: 'reception', role: 'agent', passwordHash: bcrypt.hashSync('reception123', 10) },
   { username: 'manager', role: 'manager', passwordHash: bcrypt.hashSync('manager123', 10) },
 ];
 

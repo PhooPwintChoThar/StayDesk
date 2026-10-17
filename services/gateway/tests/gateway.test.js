@@ -31,6 +31,11 @@ describe('gateway authentication and proxying', () => {
         passwordHash: bcrypt.hashSync('agent123', 10)
       },
       {
+        username: 'reception',
+        role: 'agent',
+        passwordHash: bcrypt.hashSync('reception123', 10)
+      },
+      {
         username: 'manager',
         role: 'manager',
         passwordHash: bcrypt.hashSync('manager123', 10)
@@ -103,6 +108,23 @@ describe('gateway authentication and proxying', () => {
     expect(jwt.verify(success.body.token, secret)).toMatchObject({ role: 'agent', sub: 'agent' });
     expect(failure.status).toBe(401);
     expect(disabledDevLogin.status).toBe(400);
+  });
+
+  it.each([
+    ['reception', 'reception123', 'agent'],
+    ['manager', 'manager123', 'manager']
+  ])('accepts the %s demo credentials', async (username, password, role) => {
+    const app = createApp({ secret });
+    const response = await request(app)
+      .post('/login')
+      .set('X-Forwarded-For', uniqueIp('15'))
+      .send({ username, password });
+
+    expect(response.status).toBe(200);
+    expect(jwt.verify(response.body.token, secret)).toMatchObject({
+      role,
+      sub: username
+    });
   });
 
   it('accepts dev login only when explicitly enabled', async () => {
@@ -224,6 +246,55 @@ describe('gateway authentication and proxying', () => {
       .set('Authorization', `Bearer ${token(role, { sub: `${role}-123` })}`);
 
     expect(response.status).toBe(200);
+    expect(upstream.isDone()).toBe(true);
+  });
+
+  it('allows a guest to create a reservation only for their authenticated email', async () => {
+    const app = createApp({ secret });
+    const upstream = nock(reservationUrl)
+      .post('/reservations', {
+        guest: { email: 'guest@example.com', firstName: 'Test', lastName: 'Guest' },
+        roomTypeId: 'standard'
+      })
+      .matchHeader('x-user-id', 'guest-123')
+      .reply(201, { reservationNo: 'R-10002', guestId: 'guest-123' });
+
+    const response = await request(app)
+      .post('/reservations')
+      .set('Authorization', `Bearer ${token('guest', { sub: 'guest@example.com', guestId: 'guest-123' })}`)
+      .send({
+        guest: { email: 'guest@example.com', firstName: 'Test', lastName: 'Guest' },
+        roomTypeId: 'standard'
+      });
+
+    expect(response.status).toBe(201);
+    expect(response.body).toMatchObject({ guestId: 'guest-123' });
+    expect(upstream.isDone()).toBe(true);
+  });
+
+  it('denies a guest from creating a reservation for a different email', async () => {
+    const app = createApp({ secret });
+    const response = await request(app)
+      .post('/reservations')
+      .set('Authorization', `Bearer ${token('guest', { sub: 'guest@example.com', guestId: 'guest-123' })}`)
+      .send({ guest: { email: 'other@example.com' }, roomTypeId: 'standard' });
+
+    expect(response.status).toBe(403);
+  });
+
+  it.each(['agent', 'manager'])('allows %s to create a reservation', async (role) => {
+    const app = createApp({ secret });
+    const upstream = nock(reservationUrl)
+      .post('/reservations', { guest: { email: 'guest@example.com' }, roomTypeId: 'standard' })
+      .matchHeader('x-user-id', `${role}-1`)
+      .reply(201, { reservationNo: 'R-10003' });
+
+    const response = await request(app)
+      .post('/reservations')
+      .set('Authorization', `Bearer ${token(role, { sub: `${role}-1` })}`)
+      .send({ guest: { email: 'guest@example.com' }, roomTypeId: 'standard' });
+
+    expect(response.status).toBe(201);
     expect(upstream.isDone()).toBe(true);
   });
 
